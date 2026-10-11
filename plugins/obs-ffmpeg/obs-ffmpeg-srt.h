@@ -481,11 +481,13 @@ static int libsrt_setup(URLContext *h, const char *uri)
 		&& (hostname[0] == '\0' || strcmp(hostname, "0.0.0.0") == 0)) {
 		/* srt://:<port> and srt://0.0.0.0:<port> are listener mode urls */
 		s->mode = SRT_MODE_LISTENER;
-		blog(LOG_INFO, "[obs-ffmpeg mpegts muxer / libsrt]: URL host is empty or 0.0.0.0; enabling listener mode");
+		blog(LOG_INFO,
+			"[obs-ffmpeg mpegts muxer / libsrt]: URL host is empty or 0.0.0.0; enabling listener mode");
 	}
-    if (s->mode == SRT_MODE_LISTENER && hostname[0] == '\0') {
-	   strncpy(hostname, "0.0.0.0", sizeof(hostname)-1); // listen on all interfaces by default if no interface is specified
-	   hostname[sizeof(hostname)-1] = '\0';
+	if (s->mode == SRT_MODE_LISTENER && hostname[0] == '\0') {
+		/* listen on all interfaces by default if no interface is specified */
+		strncpy(hostname, "0.0.0.0", sizeof(hostname)-1);
+		hostname[sizeof(hostname)-1] = '\0';
 	}
 
 	hints.ai_family = AF_UNSPEC;
