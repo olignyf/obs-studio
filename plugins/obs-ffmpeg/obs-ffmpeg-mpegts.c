@@ -773,6 +773,13 @@ static int mpegts_process_packet(struct ffmpeg_output *stream)
 	}
 	stream->total_bytes += packet->size;
 	uint8_t *buf = packet->data;
+	if (buf == NULL) {
+		ffmpeg_mpegts_log_error(LOG_WARNING, &stream->ff_data, "process_packet: Packet has NULL buffer",
+			av_err2str(ret));
+		ret = 0;
+		goto end;
+	}
+
 	ret = av_interleaved_write_frame(stream->ff_data.output, packet);
 	av_freep(&buf);
 
