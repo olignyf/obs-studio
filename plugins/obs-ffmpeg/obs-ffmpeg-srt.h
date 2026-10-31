@@ -31,6 +31,9 @@
 #define SRT_LIVE_DEFAULT_PAYLOAD_SIZE 1316
 #endif
 
+/* Simultaneous callers served by one SRT listener. Each gets a full copy of the stream. */
+#define SRT_MAX_LISTEN_CLIENTS 8
+
 enum SRTMode { SRT_MODE_CALLER = 0, SRT_MODE_LISTENER = 1, SRT_MODE_RENDEZVOUS = 2 };
 
 struct srt_err {
@@ -83,6 +86,10 @@ typedef struct SRTContext {
 	int tsbpd;
 	double time; // time in s in order to post logs at definite intervals
 	struct srt_err last_error;
+	/* Listener mode keeps the bound socket and fans each packet out to every accepted caller. */
+	SRTSOCKET listen_fd;
+	SRTSOCKET clients[SRT_MAX_LISTEN_CLIENTS];
+	int client_count;
 } SRTContext;
 
 #define OBS_OUTPUT_TIMEDOUT -10
@@ -237,16 +244,11 @@ static int libsrt_network_wait_fd_timeout(URLContext *h, int eid, int write, int
 	}
 }
 
-static int libsrt_listen(int eid, SRTSOCKET fd, const struct sockaddr *addr, socklen_t addrlen, URLContext *h,
-			 int64_t timeout)
+static int libsrt_listen(SRTSOCKET fd, const struct sockaddr *addr, socklen_t addrlen, URLContext *h)
 {
-	int ret;
 	int reuse = 1;
-	/* Max streamid length plus an extra space for the terminating null character */
-	char streamid[513];
-	int streamid_len = sizeof(streamid);
 
-	blog(LOG_INFO, "[obs-ffmpeg mpegts muxer / libsrt]: listening for a connection...");
+	blog(LOG_INFO, "[obs-ffmpeg mpegts muxer / libsrt]: listening for up to %d callers...", SRT_MAX_LISTEN_CLIENTS);
 
 	if (srt_setsockopt(fd, SOL_SOCKET, SRTO_REUSEADDR, &reuse, sizeof(reuse))) {
 		blog(LOG_WARNING, "[obs-ffmpeg mpegts muxer / libsrt]: setsockopt(SRTO_REUSEADDR) failed");
@@ -254,25 +256,10 @@ static int libsrt_listen(int eid, SRTSOCKET fd, const struct sockaddr *addr, soc
 	if (srt_bind(fd, addr, addrlen))
 		return libsrt_neterrno(h);
 
-	if (srt_listen(fd, 1))
+	if (srt_listen(fd, SRT_MAX_LISTEN_CLIENTS))
 		return libsrt_neterrno(h);
 
-	ret = libsrt_network_wait_fd_timeout(h, eid, 0, timeout, &h->interrupt_callback);
-	if (ret < 0)
-		return ret;
-
-	ret = srt_accept(fd, NULL, NULL);
-	if (ret < 0)
-		return libsrt_neterrno(h);
-
-	if (libsrt_socket_nonblock(ret, 1) < 0)
-		blog(LOG_DEBUG, "[obs-ffmpeg mpegts muxer / libsrt]: libsrt_socket_nonblock failed");
-
-	if (!libsrt_getsockopt(h, ret, SRTO_STREAMID, "SRTO_STREAMID", streamid, &streamid_len))
-		blog(LOG_INFO, "[obs-ffmpeg mpegts muxer / libsrt]: Accept streamid [%s], length %d", streamid,
-		     streamid_len);
-
-	return ret;
+	return 0;
 }
 
 static int libsrt_listen_connect(int eid, SRTSOCKET fd, const struct sockaddr *addr, socklen_t addrlen, int64_t timeout,
@@ -436,6 +423,139 @@ static int libsrt_set_options_pre(URLContext *h, SRTSOCKET fd)
 	return 0;
 }
 
+static void libsrt_close_client_at(SRTContext *s, int index, bool announce)
+{
+	SRTSOCKET fd = s->clients[index];
+	bool was_active = s->fd == fd;
+
+	if (s->eid >= 0)
+		srt_epoll_remove_usock(s->eid, fd);
+	srt_close(fd);
+
+	s->client_count--;
+	s->clients[index] = s->clients[s->client_count];
+	s->clients[s->client_count] = SRT_INVALID_SOCK;
+
+	if (was_active)
+		s->fd = s->client_count > 0 ? s->clients[0] : s->listen_fd;
+
+	if (announce) {
+		blog(LOG_INFO, "[obs-ffmpeg mpegts muxer / libsrt]: caller disconnected (%d/%d)", s->client_count,
+		     SRT_MAX_LISTEN_CLIENTS);
+	}
+}
+
+static void libsrt_close_all_clients(SRTContext *s, bool announce)
+{
+	while (s->client_count > 0)
+		libsrt_close_client_at(s, s->client_count - 1, announce);
+}
+
+static void libsrt_release_sockets(SRTContext *s, SRTSOCKET *fd)
+{
+	libsrt_close_all_clients(s, false);
+	if (s->eid >= 0) {
+		srt_epoll_release(s->eid);
+		s->eid = -1;
+	}
+	if (s->listen_fd != SRT_INVALID_SOCK) {
+		srt_close(s->listen_fd);
+		if (fd && *fd == s->listen_fd)
+			*fd = SRT_INVALID_SOCK;
+		s->listen_fd = SRT_INVALID_SOCK;
+	}
+	if (fd && *fd != SRT_INVALID_SOCK) {
+		srt_close(*fd);
+		*fd = SRT_INVALID_SOCK;
+	}
+	s->fd = SRT_INVALID_SOCK;
+}
+
+static int libsrt_add_client(URLContext *h, SRTSOCKET fd)
+{
+	SRTContext *s = (SRTContext *)h->priv_data;
+	int modes = SRT_EPOLL_OUT | SRT_EPOLL_ERR;
+	char streamid[513];
+	int streamid_len = (int)sizeof(streamid);
+	int ret;
+
+	if (s->client_count >= SRT_MAX_LISTEN_CLIENTS) {
+		blog(LOG_WARNING, "[obs-ffmpeg mpegts muxer / libsrt]: rejecting caller, listener is full (%d)",
+		     SRT_MAX_LISTEN_CLIENTS);
+		srt_close(fd);
+		return 0;
+	}
+
+	if (libsrt_socket_nonblock(fd, 1) < 0)
+		blog(LOG_DEBUG, "[obs-ffmpeg mpegts muxer / libsrt]: libsrt_socket_nonblock failed");
+
+	streamid[0] = '\0';
+	if (srt_getsockopt(fd, 0, SRTO_STREAMID, streamid, &streamid_len) == 0 && streamid[0] != '\0') {
+		blog(LOG_INFO, "[obs-ffmpeg mpegts muxer / libsrt]: Accept streamid [%s], length %d", streamid,
+		     streamid_len);
+	}
+
+	if ((ret = libsrt_set_options_post(h, fd)) < 0) {
+		srt_close(fd);
+		return ret;
+	}
+
+	if (srt_epoll_add_usock(s->eid, fd, &modes) < 0) {
+		ret = libsrt_neterrno(h);
+		srt_close(fd);
+		return ret;
+	}
+
+	s->clients[s->client_count++] = fd;
+	s->fd = s->clients[0];
+	blog(LOG_INFO, "[obs-ffmpeg mpegts muxer / libsrt]: caller connected (%d/%d)", s->client_count,
+	     SRT_MAX_LISTEN_CLIENTS);
+	return 0;
+}
+
+/* Accept every caller already queued on the listener. EASYNCRCV means the queue is empty. */
+static int libsrt_accept_pending(URLContext *h)
+{
+	SRTContext *s = (SRTContext *)h->priv_data;
+
+	while (s->client_count < SRT_MAX_LISTEN_CLIENTS) {
+		SRTSOCKET fd = srt_accept(s->listen_fd, NULL, NULL);
+		int ret;
+		if (fd == SRT_INVALID_SOCK) {
+			int err = srt_getlasterror(NULL);
+			if (err == SRT_EASYNCRCV)
+				return 0;
+			blog(LOG_ERROR, "[obs-ffmpeg mpegts muxer / libsrt]: accept failed: %s",
+			     srt_getlasterror_str());
+			s->last_error.srt_error_code = err;
+			s->last_error.obs_output_error_number = OBS_OUTPUT_DISCONNECTED;
+			return AVERROR(EIO);
+		}
+
+		ret = libsrt_add_client(h, fd);
+		if (ret < 0) {
+			if (s->client_count == 0)
+				return ret;
+			return 0;
+		}
+	}
+	return 0;
+}
+
+static void libsrt_prune_clients(SRTContext *s)
+{
+	int i = 0;
+	while (i < s->client_count) {
+		SRT_SOCKSTATUS state = srt_getsockstate(s->clients[i]);
+		if (state == SRTS_BROKEN || state == SRTS_CLOSING || state == SRTS_CLOSED || state == SRTS_NONEXIST) {
+			libsrt_close_client_at(s, i, true);
+		} else {
+			i++;
+			// TODO:Maybe if one stays in CONNECTING or INIT for more than X seconds close it?
+		}
+	}
+}
+
 static int libsrt_setup(URLContext *h, const char *uri)
 {
 	struct addrinfo hints = {0}, *ai, *cur_ai;
@@ -541,16 +661,37 @@ restart:
 			s->last_error.obs_output_error_number = OBS_OUTPUT_ERROR;
 			goto fail1;
 		}
+		s->listen_fd = fd;
 
-		// multi-client
-		ret = libsrt_listen(read_eid, fd, cur_ai->ai_addr, (socklen_t)cur_ai->ai_addrlen, h, s->listen_timeout);
+		ret = libsrt_listen(fd, cur_ai->ai_addr, (socklen_t)cur_ai->ai_addrlen, h);
+		if (ret < 0) {
+			srt_epoll_release(read_eid);
+			s->last_error.obs_output_error_number = OBS_OUTPUT_ERROR;
+			goto fail1;
+		}
+
+		/* Block until the first caller so the output stays in "connecting" until someone is watching. */
+		ret = libsrt_network_wait_fd_timeout(h, read_eid, 0, s->listen_timeout, &h->interrupt_callback);
 		srt_epoll_release(read_eid);
 		if (ret < 0) {
 			s->last_error.obs_output_error_number = OBS_OUTPUT_ERROR;
 			goto fail1;
 		}
-		srt_close(fd);
-		fd = ret;
+
+		s->eid = srt_epoll_create();
+		if (s->eid < 0) {
+			ret = libsrt_neterrno(h);
+			s->last_error.obs_output_error_number = OBS_OUTPUT_ERROR;
+			goto fail1;
+		}
+
+		ret = libsrt_accept_pending(h);
+		if (ret < 0 || s->client_count < 1) {
+			if (ret >= 0)
+				ret = AVERROR(EIO);
+			s->last_error.obs_output_error_number = OBS_OUTPUT_CONNECT_FAILED;
+			goto fail1;
+		}
 	} else {
 		int write_eid = ret = libsrt_epoll_create(h, fd, 1);
 		if (ret < 0) {
@@ -579,27 +720,29 @@ restart:
 			}
 		}
 	}
-	if ((ret = libsrt_set_options_post(h, fd)) < 0) {
+	if (s->mode != SRT_MODE_LISTENER && (ret = libsrt_set_options_post(h, fd)) < 0) {
 		goto fail;
 	}
 
 	int packet_size = 0;
 	int optlen = sizeof(packet_size);
-	ret = libsrt_getsockopt(h, fd, SRTO_PAYLOADSIZE, "SRTO_PAYLOADSIZE", &packet_size, &optlen);
+	SRTSOCKET opt_fd = (s->mode == SRT_MODE_LISTENER) ? s->clients[0] : fd;
+	ret = libsrt_getsockopt(h, opt_fd, SRTO_PAYLOADSIZE, "SRTO_PAYLOADSIZE", &packet_size, &optlen);
 	if (ret < 0)
 		goto fail1;
 	if (packet_size > 0)
 		h->max_packet_size = packet_size;
 
-	eid = libsrt_epoll_create(h, fd, 1);
-	if (eid < 0) {
-		ret = eid;
-		s->last_error.obs_output_error_number = OBS_OUTPUT_ERROR;
-		goto fail1;
+	if (s->mode != SRT_MODE_LISTENER) {
+		eid = libsrt_epoll_create(h, fd, 1);
+		if (eid < 0) {
+			ret = eid;
+			s->last_error.obs_output_error_number = OBS_OUTPUT_ERROR;
+			goto fail1;
+		}
+		s->fd = fd;
+		s->eid = eid;
 	}
-
-	s->fd = fd;
-	s->eid = eid;
 
 	freeaddrinfo(ai);
 	return 0;
@@ -608,14 +751,12 @@ fail:
 	if (cur_ai->ai_next) {
 		/* Retry with the next sockaddr */
 		cur_ai = cur_ai->ai_next;
-		if (fd >= 0)
-			srt_close(fd);
+		libsrt_release_sockets(s, &fd);
 		ret = 0;
 		goto restart;
 	}
 fail1:
-	if (fd >= 0)
-		srt_close(fd);
+	libsrt_release_sockets(s, &fd);
 	freeaddrinfo(ai);
 	return ret;
 }
@@ -651,6 +792,12 @@ static void libsrt_set_defaults(SRTContext *s)
 	s->transtype = SRTT_LIVE;
 	s->linger = -1;
 	s->tsbpd = -1;
+	s->fd = SRT_INVALID_SOCK;
+	s->eid = -1;
+	s->listen_fd = SRT_INVALID_SOCK;
+	s->client_count = 0;
+	for (int i = 0; i < SRT_MAX_LISTEN_CLIENTS; i++)
+		s->clients[i] = SRT_INVALID_SOCK;
 }
 
 static int libsrt_close(URLContext *h);
@@ -661,13 +808,14 @@ static int libsrt_open(URLContext *h, const char *uri)
 	char buf[1024];
 	int ret = 0;
 
+	libsrt_set_defaults(s);
+
 	if (srt_startup() < 0) {
 		blog(LOG_ERROR, "[obs-ffmpeg mpegts muxer / libsrt]: libsrt failed to load");
 		return OBS_OUTPUT_ERROR;
 	} else {
 		blog(LOG_INFO, "[obs-ffmpeg mpegts muxer / libsrt]: libsrt version %s loaded", SRT_VERSION_STRING);
 	}
-	libsrt_set_defaults(s);
 
 	s->last_error.obs_output_error_number = OBS_OUTPUT_SUCCESS;
 	s->last_error.srt_error_code = SRT_SUCCESS;
@@ -843,20 +991,64 @@ err:
 	return ret;
 }
 
+static int libsrt_write_listener(URLContext *h, const uint8_t *buf, int size)
+{
+	SRTContext *s = (SRTContext *)h->priv_data;
+	int ret;
+	int i;
+
+	libsrt_prune_clients(s);
+	ret = libsrt_accept_pending(h);
+	if (ret < 0 && s->client_count == 0)
+		return ret;
+	if (s->client_count == 0)
+		return size;
+
+	ret = libsrt_network_wait_fd_timeout(h, s->eid, 1, h->rw_timeout, &h->interrupt_callback);
+	if (ret < 0)
+		return ret;
+
+	for (i = 0; i < s->client_count;) {
+		int sent = srt_send(s->clients[i], (char *)buf, size);
+		if (sent < 0) {
+			int err = srt_getlasterror(NULL);
+			if (err == SRT_EASYNCSND) {
+				i++;
+				continue;
+			}
+			blog(LOG_WARNING, "[obs-ffmpeg mpegts muxer / libsrt]: dropping caller: %s",
+			     srt_getlasterror_str());
+			libsrt_close_client_at(s, i, true);
+			continue;
+		}
+		i++;
+	}
+
+	/* A caller leaving must not stop the output. The listener stays up for the next one. */
+	return size;
+}
+
 static int libsrt_write(URLContext *h, const uint8_t *buf, int size)
 {
 	SRTContext *s = (SRTContext *)h->priv_data;
 	int ret;
 	SRT_TRACEBSTATS perf;
 
-	ret = libsrt_network_wait_fd_timeout(h, s->eid, 1, h->rw_timeout, &h->interrupt_callback);
-	if (ret)
-		return ret;
-
-	ret = srt_send(s->fd, (char *)buf, size);
-	if (ret < 0) {
-		ret = libsrt_neterrno(h);
+	if (s->mode == SRT_MODE_LISTENER) {
+		ret = libsrt_write_listener(h, buf, size);
+		if (ret < 0)
+			return ret;
 	} else {
+		ret = libsrt_network_wait_fd_timeout(h, s->eid, 1, h->rw_timeout, &h->interrupt_callback);
+		if (ret)
+			return ret;
+
+		ret = srt_send(s->fd, (char *)buf, size);
+		if (ret < 0)
+			return libsrt_neterrno(h);
+	}
+
+	{
 		/* log every 60 seconds the rtt and link bandwidth
 		 * rtt: round-trip time
 		 * link bandwidth: bandwidth from ingest to egress
@@ -871,9 +1063,12 @@ static int libsrt_write(URLContext *h, const uint8_t *buf, int size)
 		double time = (double)timesp.tv_sec + 0.000000001 * (double)timesp.tv_nsec;
 #endif
 		if (time > (s->time + 60.0)) {
-			srt_bistats(s->fd, &perf, 0, 1);
-			blog(LOG_DEBUG, "[obs-ffmpeg mpegts muxer / libsrt]: RTT [%.2f ms], Link Bandwidth [%.1f Mbps]",
-			     perf.msRTT, perf.mbpsBandwidth);
+			SRTSOCKET stats_fd = (s->mode == SRT_MODE_LISTENER) ? s->clients[0] : s->fd;
+			if (stats_fd != SRT_INVALID_SOCK && srt_bistats(stats_fd, &perf, 0, 1) == 0) {
+				blog(LOG_DEBUG,
+				     "[obs-ffmpeg mpegts muxer / libsrt]: RTT [%.2f ms], Link Bandwidth [%.1f Mbps]",
+				     perf.msRTT, perf.mbpsBandwidth);
+			}
 			s->time = time;
 		}
 	}
@@ -881,18 +1076,12 @@ static int libsrt_write(URLContext *h, const uint8_t *buf, int size)
 	return ret;
 }
 
-static int libsrt_close(URLContext *h)
+static void libsrt_log_session(SRTSOCKET fd)
 {
-	SRTContext *s = (SRTContext *)h->priv_data;
-	if (!s)
-		return 0;
-	if (s->streamid)
-		av_freep(&s->streamid);
-	if (s->passphrase)
-		av_freep(&s->passphrase);
-	/* Log stream stats. */
 	SRT_TRACEBSTATS perf = {0};
-	srt_bstats(s->fd, &perf, 1);
+	if (fd == SRT_INVALID_SOCK || srt_bstats(fd, &perf, 1) < 0)
+		return;
+
 	blog(LOG_INFO, "---------------------------------");
 	blog(LOG_INFO,
 	     "[obs-ffmpeg mpegts muxer / libsrt]: Session Summary\n"
@@ -904,13 +1093,48 @@ static int libsrt_close(URLContext *h)
 	     (double)perf.msTimeStamp / 1000.0, perf.mbpsSendRate, (double)perf.byteSentTotal / 1000000.0,
 	     perf.byteSentTotal ? perf.byteRetransTotal / perf.byteSentTotal * 100.0 : 0,
 	     perf.byteSentTotal ? perf.byteSndDropTotal / perf.byteSentTotal * 100.0 : 0);
+}
 
-	srt_epoll_release(s->eid);
-	int err = srt_close(s->fd);
-	if (err < 0) {
-		blog(LOG_ERROR, "[obs-ffmpeg mpegts muxer / libsrt]: %s", srt_getlasterror_str());
-		return -1;
+static int libsrt_close(URLContext *h)
+{
+	SRTContext *s = (SRTContext *)h->priv_data;
+	int i;
+	if (!s)
+		return 0;
+	if (s->streamid)
+		av_freep(&s->streamid);
+	if (s->passphrase)
+		av_freep(&s->passphrase);
+
+	if (s->mode == SRT_MODE_LISTENER) {
+		for (i = 0; i < s->client_count; i++)
+			libsrt_log_session(s->clients[i]);
+		libsrt_close_all_clients(s, false);
+		if (s->listen_fd != SRT_INVALID_SOCK) {
+			srt_close(s->listen_fd);
+			s->listen_fd = SRT_INVALID_SOCK;
+		}
+	} else {
+		libsrt_log_session(s->fd);
+		if (s->fd != SRT_INVALID_SOCK) {
+			int err = srt_close(s->fd);
+			s->fd = SRT_INVALID_SOCK;
+			if (err < 0) {
+				blog(LOG_ERROR, "[obs-ffmpeg mpegts muxer / libsrt]: %s", srt_getlasterror_str());
+				if (s->eid >= 0) {
+					srt_epoll_release(s->eid);
+					s->eid = -1;
+				}
+				return -1;
+			}
+		}
 	}
+
+	if (s->eid >= 0) {
+		srt_epoll_release(s->eid);
+		s->eid = -1;
+	}
+	s->fd = SRT_INVALID_SOCK;
 
 	srt_cleanup();
 	blog(LOG_INFO, "[obs-ffmpeg mpegts muxer / libsrt]: SRT connection closed");
