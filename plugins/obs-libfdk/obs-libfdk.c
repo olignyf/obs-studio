@@ -142,8 +142,27 @@ static void *libfdk_create(obs_data_t *settings, obs_encoder_t *encoder)
 	CHECK_LIBFDK(aacEncOpen(&enc->fdkhandle, 0, enc->channels));
 	hasFdkHandle = true;
 
-	CHECK_LIBFDK(aacEncoder_SetParam(enc->fdkhandle, AACENC_AOT,
-					 2)); // MPEG-4 AAC-LC
+	/* AAC-LC is fixed at 1024 samples. Smaller mixer ticks need LD or ELD,
+	 * which are the profiles that can emit a 512, 256, or 128 sample packet. */
+	uint32_t packet_samples = audio_output_get_frames(audio);
+	int aot = 2;
+	if (!packet_samples || packet_samples > 512) {
+		packet_samples = 1024;
+	} else if (packet_samples > 256) {
+		aot = 23;
+		packet_samples = 512;
+	} else if (packet_samples > 128) {
+		aot = 39;
+		packet_samples = 256;
+	} else {
+		aot = 39;
+		packet_samples = 128;
+	}
+
+	CHECK_LIBFDK(aacEncoder_SetParam(enc->fdkhandle, AACENC_AOT, aot));
+	if (aot != 2) {
+		CHECK_LIBFDK(aacEncoder_SetParam(enc->fdkhandle, AACENC_GRANULE_LENGTH, packet_samples));
+	}
 	CHECK_LIBFDK(aacEncoder_SetParam(enc->fdkhandle, AACENC_SAMPLERATE, enc->sample_rate));
 	CHECK_LIBFDK(aacEncoder_SetParam(enc->fdkhandle, AACENC_CHANNELMODE, mode));
 	CHECK_LIBFDK(aacEncoder_SetParam(enc->fdkhandle, AACENC_CHANNELORDER, 1));
@@ -157,6 +176,12 @@ static void *libfdk_create(obs_data_t *settings, obs_encoder_t *encoder)
 
 	CHECK_LIBFDK(aacEncInfo(enc->fdkhandle, &enc->info));
 
+	if ((uint32_t)enc->info.frameLength != packet_samples) {
+		blog(LOG_ERROR, "libfdk_aac opened at %u samples, requested %u", (unsigned)enc->info.frameLength,
+		     packet_samples);
+		goto fail;
+	}
+
 	enc->frame_size_bytes = enc->info.frameLength * 2 * enc->channels;
 
 	enc->packet_buffer_size = enc->channels * 768;
@@ -167,7 +192,8 @@ static void *libfdk_create(obs_data_t *settings, obs_encoder_t *encoder)
 
 	blog(LOG_INFO, "libfdk_aac encoder created");
 
-	blog(LOG_INFO, "libfdk_aac bitrate: %d, channels: %d", bitrate / 1000, enc->channels);
+	blog(LOG_INFO, "libfdk_aac bitrate: %d, channels: %d, packet: %u samples (AOT %d)", bitrate / 1000,
+	     enc->channels, packet_samples, aot);
 
 	return enc;
 

@@ -22,6 +22,7 @@
 #include <obs-module.h>
 
 #include <libavutil/channel_layout.h>
+#include <libavutil/opt.h>
 #include <libavformat/avformat.h>
 
 #include "obs-ffmpeg-formats.h"
@@ -51,8 +52,9 @@ struct enc_encoder {
 	size_t audio_planes;
 	size_t audio_size;
 
-	int frame_size; /* pretty much always 1024 for AAC */
+	int frame_size;
 	int frame_size_bytes;
+	int requested_frame_size;
 };
 
 static const char *aac_getname(void *unused)
@@ -141,7 +143,12 @@ static bool initialize_codec(struct enc_encoder *enc)
 
 	enc->frame_size = enc->context->frame_size;
 	if (!enc->frame_size)
-		enc->frame_size = 1024;
+		enc->frame_size = enc->requested_frame_size ? enc->requested_frame_size : 1024;
+
+	if (enc->requested_frame_size && enc->frame_size != enc->requested_frame_size) {
+		warn("AAC encoder opened at %d samples, requested %d", enc->frame_size, enc->requested_frame_size);
+		return false; // returning false will fail the start record operation and notify the user
+	}
 
 	enc->frame_size_bytes = enc->frame_size * (int)enc->audio_size;
 
@@ -187,6 +194,37 @@ static void *enc_create(obs_data_t *settings, obs_encoder_t *encoder, const char
 		enc->type = alt;
 	}
 
+	/* The built-in AAC encoder always writes a 1024-sample packet. A shorter
+	 * mixer tick has to be encoded with libfdk AAC-LD (512) or AAC-ELD (256/128). */
+	int aac_profile = AV_PROFILE_UNKNOWN;
+	int aac_frame_length = 0;
+	if (enc->codec && enc->codec->id == AV_CODEC_ID_AAC && audio) {
+		uint32_t frames = audio_output_get_frames(audio);
+		if (frames && frames < AUDIO_OUTPUT_FRAMES) {
+			const AVCodec *fdk = avcodec_find_encoder_by_name("libfdk_aac");
+			if (!fdk) {
+				warn("Audio frame size %u requires libfdk AAC. The built-in AAC encoder only emits "
+				     "1024-sample packets.",
+				     frames);
+				goto fail;
+			}
+
+			enc->codec = fdk;
+			enc->type = "libfdk_aac";
+			if (frames <= 128) {
+				aac_profile = AV_PROFILE_AAC_ELD;
+				aac_frame_length = 128;
+			} else if (frames <= 256) {
+				aac_profile = AV_PROFILE_AAC_ELD;
+				aac_frame_length = 256;
+			} else {
+				aac_profile = AV_PROFILE_AAC_LD;
+				aac_frame_length = 512;
+			}
+			enc->requested_frame_size = aac_frame_length;
+		}
+	}
+
 	blog(LOG_INFO, "---------------------------------");
 
 	if (!enc->codec) {
@@ -211,6 +249,9 @@ static void *enc_create(obs_data_t *settings, obs_encoder_t *encoder, const char
 		warn("Failed to create codec context");
 		goto fail;
 	}
+
+	if (aac_profile != AV_PROFILE_UNKNOWN)
+		enc->context->profile = aac_profile;
 
 	if (codec_desc->props & AV_CODEC_PROP_LOSSLESS)
 		// Set by encoder on init, not known at this time
@@ -296,8 +337,19 @@ static void *enc_create(obs_data_t *settings, obs_encoder_t *encoder, const char
 
 	enc->context->flags = AV_CODEC_FLAG_GLOBAL_HEADER;
 
-	if (initialize_codec(enc))
+	if (aac_frame_length > 0) {
+		int opt = av_opt_set_int(enc->context->priv_data, "frame_length", aac_frame_length, 0);
+		if (opt < 0) {
+			warn("Unable to set AAC frame_length to %d: %s", aac_frame_length, av_err2str(opt));
+			goto fail;
+		}
+	}
+
+	if (initialize_codec(enc)) {
+		if (aac_frame_length > 0)
+			info("AAC packet size: %d samples", enc->frame_size);
 		return enc;
+	}
 
 fail:
 	enc_destroy(enc);
