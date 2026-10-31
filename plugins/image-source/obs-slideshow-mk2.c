@@ -904,7 +904,7 @@ static inline bool ss_audio_render_(obs_source_t *transition, uint64_t *ts_out,
 			float *out = audio_output->output[mix].data[ch];
 			float *in = child_audio.output[mix].data[ch];
 
-			memcpy(out, in, AUDIO_OUTPUT_FRAMES * sizeof(float));
+			memcpy(out, in, obs_get_audio_output_frames() * sizeof(float));
 		}
 	}
 

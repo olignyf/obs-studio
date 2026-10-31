@@ -464,6 +464,8 @@ struct obs_core_audio {
 	struct deque tasks;
 
 	struct obs_source *monitoring_duplicating_source;
+
+	uint32_t output_frames;
 };
 
 /* user sources, output channels, and displays */
@@ -585,6 +587,12 @@ struct obs_core {
 };
 
 extern struct obs_core *obs;
+
+static inline uint32_t obs_audio_frames(void)
+{
+	uint32_t frames = obs ? obs->audio.output_frames : 0;
+	return frames ? frames : AUDIO_OUTPUT_FRAMES;
+}
 
 struct obs_graphics_context {
 	uint64_t last_time;

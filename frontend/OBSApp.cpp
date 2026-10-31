@@ -419,6 +419,9 @@ void OBSApp::InitUserConfigDefaults()
 
 	config_set_default_int(userConfig, "Appearance", "FontScale", 10);
 	config_set_default_int(userConfig, "Appearance", "Density", 1);
+
+	config_set_default_bool(userConfig, "Audio", "LowLatencyAudioBuffering", true);
+	config_set_default_uint(userConfig, "Audio", "AudioFrameSize", AUDIO_OUTPUT_FRAMES);
 }
 
 static bool do_mkdir(const char *path)

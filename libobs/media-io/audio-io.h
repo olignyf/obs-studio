@@ -29,6 +29,15 @@ extern "C" {
 #define MAX_AUDIO_CHANNELS 8
 #define MAX_DEVICE_INPUT_CHANNELS 64
 #define AUDIO_OUTPUT_FRAMES 1024
+/* Smallest tick the audio thread will run. Must stay a power of two and fit in AUDIO_OUTPUT_FRAMES. */
+#define AUDIO_OUTPUT_FRAMES_MIN 128
+
+static inline uint32_t audio_output_frames_sanitize(uint32_t frames)
+{
+	if (frames < AUDIO_OUTPUT_FRAMES_MIN || frames > AUDIO_OUTPUT_FRAMES || (frames & (frames - 1)) != 0)
+		return AUDIO_OUTPUT_FRAMES;
+	return frames;
+}
 
 #define TOTAL_AUDIO_SIZE (MAX_AUDIO_MIXES * MAX_AUDIO_CHANNELS * AUDIO_OUTPUT_FRAMES * sizeof(float))
 
@@ -96,6 +105,9 @@ struct audio_output_info {
 
 	audio_input_callback_t input_callback;
 	void *input_param;
+
+	/* Samples mixed per tick. 0 selects AUDIO_OUTPUT_FRAMES. */
+	uint32_t output_frames;
 };
 
 struct audio_convert_info {
@@ -221,6 +233,7 @@ EXPORT size_t audio_output_get_block_size(const audio_t *audio);
 EXPORT size_t audio_output_get_planes(const audio_t *audio);
 EXPORT size_t audio_output_get_channels(const audio_t *audio);
 EXPORT uint32_t audio_output_get_sample_rate(const audio_t *audio);
+EXPORT uint32_t audio_output_get_frames(const audio_t *audio);
 EXPORT const struct audio_output_info *audio_output_get_info(const audio_t *audio);
 
 #ifdef __cplusplus

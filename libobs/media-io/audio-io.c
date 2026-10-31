@@ -159,7 +159,8 @@ static inline void clamp_audio_output(struct audio_output *audio, size_t bytes)
 
 static void input_and_output(struct audio_output *audio, uint64_t audio_time, uint64_t prev_time)
 {
-	size_t bytes = AUDIO_OUTPUT_FRAMES * audio->block_size;
+	uint32_t frames = audio->info.output_frames;
+	size_t bytes = frames * audio->block_size;
 	struct audio_output_data data[MAX_AUDIO_MIXES];
 	uint32_t active_mixes = 0;
 	uint64_t new_ts = 0;
@@ -199,7 +200,7 @@ static void input_and_output(struct audio_output *audio, uint64_t audio_time, ui
 
 	/* output */
 	for (size_t i = 0; i < MAX_AUDIO_MIXES; i++)
-		do_audio_output(audio, i, new_ts, AUDIO_OUTPUT_FRAMES);
+		do_audio_output(audio, i, new_ts, frames);
 }
 
 static void *audio_thread(void *param)
@@ -211,6 +212,7 @@ static void *audio_thread(void *param)
 
 	struct audio_output *audio = param;
 	size_t rate = audio->info.samples_per_sec;
+	uint32_t frames = audio->info.output_frames;
 	uint64_t samples = 0;
 	uint64_t start_time = os_gettime_ns();
 	uint64_t prev_time = start_time;
@@ -221,7 +223,7 @@ static void *audio_thread(void *param)
 		profile_store_name(obs_get_profiler_name_store(), "audio_thread(%s)", audio->info.name);
 
 	while (os_event_try(audio->stop_event) == EAGAIN) {
-		samples += AUDIO_OUTPUT_FRAMES;
+		samples += frames;
 		uint64_t audio_time = start_time + audio_frames_to_ns(rate, samples);
 
 		os_sleepto_ns_fast(audio_time);
@@ -368,6 +370,7 @@ int audio_output_open(audio_t **audio, struct audio_output_info *info)
 	out->input_cb = info->input_callback;
 	out->input_param = info->input_param;
 	out->block_size = (planar ? 1 : out->channels) * get_audio_bytes_per_channel(info->format);
+	out->info.output_frames = audio_output_frames_sanitize(info->output_frames);
 
 	if (pthread_mutex_init_recursive(&out->input_mutex) != 0)
 		goto fail0;
@@ -452,4 +455,9 @@ size_t audio_output_get_channels(const audio_t *audio)
 uint32_t audio_output_get_sample_rate(const audio_t *audio)
 {
 	return audio->info.samples_per_sec;
+}
+
+uint32_t audio_output_get_frames(const audio_t *audio)
+{
+	return audio ? audio->info.output_frames : 0;
 }

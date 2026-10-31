@@ -336,6 +336,16 @@ void RestrictResetBitrates(initializer_list<QComboBox *> boxes, int maxbitrate);
 #define ADV_RESTART     &OBSBasicSettings::AdvancedChangedRestart
 /* clang-format on */
 
+static void FillAudioFrameSizeCombo(QComboBox *combo)
+{
+	const uint32_t sizes[] = {1024, 512, 256, 128};
+
+	combo->clear();
+	for (uint32_t size : sizes) {
+		combo->addItem(QString::number(size), size);
+	}
+}
+
 OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	: QDialog(parent),
 	  main(qobject_cast<OBSBasic *>(parent)),
@@ -521,8 +531,10 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->advReplayBuf,         CHECK_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->advRBSecMax,          SCROLL_CHANGED, OUTPUTS_CHANGED);
 	HookWidget(ui->advRBMegsMax,         SCROLL_CHANGED, OUTPUTS_CHANGED);
+	FillAudioFrameSizeCombo(ui->audioFrameSize);
 	HookWidget(ui->channelSetup,         COMBO_CHANGED,  AUDIO_RESTART);
 	HookWidget(ui->sampleRate,           COMBO_CHANGED,  AUDIO_RESTART);
+	HookWidget(ui->audioFrameSize,       COMBO_CHANGED,  AUDIO_RESTART);
 	HookWidget(ui->meterDecayRate,       COMBO_CHANGED,  AUDIO_CHANGED);
 	HookWidget(ui->peakMeterType,        COMBO_CHANGED,  AUDIO_CHANGED);
 	HookWidget(ui->desktopAudioDevice1,  COMBO_CHANGED,  AUDIO_CHANGED);
@@ -910,6 +922,7 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 
 	channelIndex = ui->channelSetup->currentIndex();
 	sampleRateIndex = ui->sampleRate->currentIndex();
+	audioFrameSizeIndex = ui->audioFrameSize->currentIndex();
 	llBufferingEnabled = ui->lowLatencyBuffering->isChecked();
 
 	QRegularExpression rx("\\d{1,5}x\\d{1,5}");
@@ -2503,6 +2516,7 @@ void OBSBasicSettings::LoadAudioSettings()
 	double meterDecayRate = config_get_double(main->Config(), "Audio", "MeterDecayRate");
 	uint32_t peakMeterTypeIdx = config_get_uint(main->Config(), "Audio", "PeakMeterType");
 	bool enableLLAudioBuffering = config_get_bool(App()->GetUserConfig(), "Audio", "LowLatencyAudioBuffering");
+	uint32_t audioFrameSize = (uint32_t)config_get_uint(App()->GetUserConfig(), "Audio", "AudioFrameSize");
 
 	loading = true;
 
@@ -2544,6 +2558,10 @@ void OBSBasicSettings::LoadAudioSettings()
 
 	ui->peakMeterType->setCurrentIndex(peakMeterTypeIdx);
 	ui->lowLatencyBuffering->setChecked(enableLLAudioBuffering);
+	int frameSizeIdx = ui->audioFrameSize->findData(audio_output_frames_sanitize(audioFrameSize));
+	if (frameSizeIdx != -1) {
+		ui->audioFrameSize->setCurrentIndex(frameSizeIdx);
+	}
 
 	LoadAudioDevices();
 	LoadAudioSources();
@@ -3683,6 +3701,12 @@ void OBSBasicSettings::SaveAudioSettings()
 		config_set_bool(App()->GetUserConfig(), "Audio", "LowLatencyAudioBuffering", enableLLAudioBuffering);
 	}
 
+	if (WidgetChanged(ui->audioFrameSize)) {
+		uint32_t audioFrameSize = ui->audioFrameSize->currentData().toUInt();
+		config_set_uint(App()->GetUserConfig(), "Audio", "AudioFrameSize",
+				audio_output_frames_sanitize(audioFrameSize));
+	}
+
 	for (auto &audioSource : audioSources) {
 		auto source = OBSGetStrongRef(get<0>(audioSource));
 		if (!source) {
@@ -3824,8 +3848,9 @@ void OBSBasicSettings::SaveSettings()
 	}
 
 	bool langChanged = (ui->language->currentIndex() != prevLangIndex);
-	bool audioRestart =
-		(ui->channelSetup->currentIndex() != channelIndex || ui->sampleRate->currentIndex() != sampleRateIndex);
+	bool audioRestart = (ui->channelSetup->currentIndex() != channelIndex ||
+			     ui->sampleRate->currentIndex() != sampleRateIndex ||
+			     ui->audioFrameSize->currentIndex() != audioFrameSizeIndex);
 	bool browserHWAccelChanged = (ui->browserHWAccel && ui->browserHWAccel->isChecked() != prevBrowserAccel);
 
 	if (langChanged || audioRestart || browserHWAccelChanged) {
@@ -4313,10 +4338,11 @@ void OBSBasicSettings::AudioChangedRestart()
 	if (!loading) {
 		int currentChannelIndex = ui->channelSetup->currentIndex();
 		int currentSampleRateIndex = ui->sampleRate->currentIndex();
+		int currentFrameSizeIndex = ui->audioFrameSize->currentIndex();
 		bool currentLLAudioBufVal = ui->lowLatencyBuffering->isChecked();
 
 		if (currentChannelIndex != channelIndex || currentSampleRateIndex != sampleRateIndex ||
-		    currentLLAudioBufVal != llBufferingEnabled) {
+		    currentFrameSizeIndex != audioFrameSizeIndex || currentLLAudioBufVal != llBufferingEnabled) {
 			ui->audioMsg->setText(QTStr("Basic.Settings.ProgramRestart"));
 			ui->audioMsg->setVisible(true);
 		} else {

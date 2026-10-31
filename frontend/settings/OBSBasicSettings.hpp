@@ -72,6 +72,7 @@ private:
 	bool forceAuthReload = false;
 	bool forceUpdateCheck = false;
 	int sampleRateIndex = 0;
+	int audioFrameSizeIndex = 0;
 	int channelIndex = 0;
 	bool llBufferingEnabled = false;
 	bool hotkeysLoaded = false;

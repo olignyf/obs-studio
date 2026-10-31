@@ -511,7 +511,7 @@ static bool stinger_audio_render(void *data, uint64_t *ts_out, struct obs_source
 		for (size_t ch = 0; ch < channels; ch++) {
 			register float *out = audio->output[mix].data[ch];
 			register float *in = child_audio.output[mix].data[ch];
-			register float *end = in + AUDIO_OUTPUT_FRAMES;
+			register float *end = in + obs_get_audio_output_frames();
 
 			while (in < end)
 				*(out++) += *(in++);

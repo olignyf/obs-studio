@@ -252,6 +252,9 @@ struct obs_audio_info2 {
 
 	uint32_t max_buffering_ms;
 	bool fixed_buffering;
+
+	/* Samples mixed per tick. 0 selects AUDIO_OUTPUT_FRAMES (1024). */
+	uint32_t output_frames;
 };
 
 /**
@@ -485,6 +488,7 @@ EXPORT bool obs_get_audio_info(struct obs_audio_info *oai);
  * Returns false if no audio.
  */
 EXPORT bool obs_get_audio_info2(struct obs_audio_info2 *oai2);
+EXPORT uint32_t obs_get_audio_output_frames(void);
 
 /**
  * Opens a plugin module directly from a specific path.

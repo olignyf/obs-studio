@@ -5252,7 +5252,7 @@ static float get_source_volume(obs_source_t *source, uint64_t os_time)
 static inline void multiply_output_audio(obs_source_t *source, size_t mix, size_t channels, float vol)
 {
 	register float *out = source->audio_output_buf[mix][0];
-	register float *end = out + AUDIO_OUTPUT_FRAMES * channels;
+	register float *end = out + obs_audio_frames() * channels;
 
 	while (out < end)
 		*(out++) *= vol;
@@ -5262,7 +5262,7 @@ static inline void multiply_vol_data(obs_source_t *source, size_t mix, size_t ch
 {
 	for (size_t ch = 0; ch < channels; ch++) {
 		register float *out = source->audio_output_buf[mix][ch];
-		register float *end = out + AUDIO_OUTPUT_FRAMES;
+		register float *end = out + obs_audio_frames();
 		register float *vol = vol_data;
 
 		while (out < end)
@@ -5306,7 +5306,7 @@ static void apply_audio_actions(obs_source_t *source, size_t channels, size_t sa
 
 		new_frame_num = conv_time_to_frames(sample_rate, timestamp - source->audio_ts);
 
-		if (new_frame_num >= AUDIO_OUTPUT_FRAMES)
+		if (new_frame_num >= obs_audio_frames())
 			break;
 
 		da_erase(source->audio_actions, i--);
@@ -5321,7 +5321,7 @@ static void apply_audio_actions(obs_source_t *source, size_t channels, size_t sa
 		cur_vol = get_source_volume(source, timestamp);
 	}
 
-	for (; frame_num < AUDIO_OUTPUT_FRAMES; frame_num++)
+	for (; frame_num < obs_audio_frames(); frame_num++)
 		vol_data[frame_num] = cur_vol;
 
 	pthread_mutex_unlock(&source->audio_actions_mutex);
@@ -5347,7 +5347,7 @@ static void apply_audio_volume(obs_source_t *source, uint32_t mixers, size_t cha
 	pthread_mutex_unlock(&source->audio_actions_mutex);
 
 	if (actions_pending) {
-		uint64_t duration = conv_frames_to_time(sample_rate, AUDIO_OUTPUT_FRAMES);
+		uint64_t duration = conv_frames_to_time(sample_rate, obs_audio_frames());
 
 		if (action.timestamp < (source->audio_ts + duration)) {
 			apply_audio_actions(source, channels, sample_rate);
@@ -5431,7 +5431,7 @@ static void audio_submix(obs_source_t *source, size_t channels, size_t sample_ra
 		audio.data[i] = (const uint8_t *)audio_data.data[i];
 
 	audio.samples_per_sec = (uint32_t)sample_rate;
-	audio.frames = AUDIO_OUTPUT_FRAMES;
+	audio.frames = obs_audio_frames();
 	audio.format = AUDIO_FORMAT_FLOAT_PLANAR;
 	audio.speakers = (enum speaker_layout)channels;
 	audio.timestamp = ts;

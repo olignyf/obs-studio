@@ -1527,7 +1527,7 @@ static void apply_scene_item_audio_actions(struct obs_scene_item *item, float *b
 
 		new_frame_num = util_mul_div64(timestamp - ts, sample_rate, 1000000000ULL);
 
-		if (ts && new_frame_num >= AUDIO_OUTPUT_FRAMES)
+		if (ts && new_frame_num >= obs_audio_frames())
 			break;
 
 		da_erase(item->audio_actions, i--);
@@ -1545,7 +1545,7 @@ static void apply_scene_item_audio_actions(struct obs_scene_item *item, float *b
 	}
 
 	if (buf) {
-		for (; frame_num < AUDIO_OUTPUT_FRAMES; frame_num++)
+		for (; frame_num < obs_audio_frames(); frame_num++)
 			buf[frame_num] = cur_visible ? 1.0f : 0.0f;
 	}
 
@@ -1572,7 +1572,7 @@ static bool apply_scene_item_volume(struct obs_scene_item *item, float *buf, uin
 	pthread_mutex_unlock(&item->actions_mutex);
 
 	if (actions_pending) {
-		uint64_t duration = util_mul_div64(AUDIO_OUTPUT_FRAMES, 1000000000ULL, sample_rate);
+		uint64_t duration = util_mul_div64(obs_audio_frames(), 1000000000ULL, sample_rate);
 
 		if (!ts || action.timestamp < (ts + duration)) {
 			apply_scene_item_audio_actions(item, buf, ts, sample_rate);
@@ -1684,12 +1684,12 @@ static bool scene_audio_render(void *data, uint64_t *ts_out, struct obs_source_a
 
 		pos = (size_t)ns_to_audio_frames(sample_rate, source_ts - timestamp);
 
-		if (pos >= AUDIO_OUTPUT_FRAMES) {
+		if (pos >= obs_audio_frames()) {
 			item = item->next;
 			continue;
 		}
 
-		count = AUDIO_OUTPUT_FRAMES - pos;
+		count = obs_audio_frames() - pos;
 
 		if (!apply_buf && !item->visible && !transition_active(item->hide_transition)) {
 			item = item->next;

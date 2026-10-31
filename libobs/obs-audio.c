@@ -90,7 +90,7 @@ static inline size_t convert_time_to_frames(size_t sample_rate, uint64_t t)
 static inline void mix_audio(struct audio_output_data *mixes, obs_source_t *source, size_t channels, size_t sample_rate,
 			     struct ts_info *ts)
 {
-	size_t total_floats = AUDIO_OUTPUT_FRAMES;
+	size_t total_floats = obs_audio_frames();
 	size_t start_point = 0;
 
 	if (source->audio_ts < ts->start || ts->end <= source->audio_ts)
@@ -98,7 +98,7 @@ static inline void mix_audio(struct audio_output_data *mixes, obs_source_t *sour
 
 	if (source->audio_ts != ts->start) {
 		start_point = convert_time_to_frames(sample_rate, source->audio_ts - ts->start);
-		if (start_point == AUDIO_OUTPUT_FRAMES)
+		if (start_point == obs_audio_frames())
 			return;
 
 		total_floats -= start_point;
@@ -218,12 +218,12 @@ static bool discard_if_stopped(obs_source_t *source, size_t channels)
 	}
 }
 
-#define MAX_AUDIO_SIZE (AUDIO_OUTPUT_FRAMES * sizeof(float))
+#define MAX_AUDIO_SIZE (obs_audio_frames() * sizeof(float))
 
 static inline void discard_audio(struct obs_core_audio *audio, obs_source_t *source, size_t channels,
 				 size_t sample_rate, struct ts_info *ts)
 {
-	size_t total_floats = AUDIO_OUTPUT_FRAMES;
+	size_t total_floats = obs_audio_frames();
 	size_t size;
 	/* debug assert only */
 	UNUSED_PARAMETER(audio);
@@ -272,7 +272,7 @@ static inline void discard_audio(struct obs_core_audio *audio, obs_source_t *sou
 
 	if (source->audio_ts != ts->start && source->audio_ts != (ts->start - 1)) {
 		size_t start_point = convert_time_to_frames(sample_rate, source->audio_ts - ts->start);
-		if (start_point == AUDIO_OUTPUT_FRAMES) {
+		if (start_point == obs_audio_frames()) {
 #if DEBUG_AUDIO == 1
 			if (is_audio_source)
 				blog(LOG_DEBUG, "can't discard, start point is "
@@ -332,7 +332,7 @@ static void set_fixed_audio_buffering(struct obs_core_audio *audio, size_t sampl
 	ticks = audio->max_buffering_ticks - audio->total_buffering_ticks;
 	audio->total_buffering_ticks += ticks;
 
-	total_ms = audio->total_buffering_ticks * AUDIO_OUTPUT_FRAMES * 1000 / sample_rate;
+	total_ms = audio->total_buffering_ticks * obs_audio_frames() * 1000 / sample_rate;
 
 	blog(LOG_INFO,
 	     "Enabling fixed audio buffering, total "
@@ -340,13 +340,13 @@ static void set_fixed_audio_buffering(struct obs_core_audio *audio, size_t sampl
 	     (int)total_ms);
 
 	new_ts.start =
-		audio->buffered_ts - audio_frames_to_ns(sample_rate, audio->buffering_wait_ticks * AUDIO_OUTPUT_FRAMES);
+		audio->buffered_ts - audio_frames_to_ns(sample_rate, audio->buffering_wait_ticks * obs_audio_frames());
 
 	while (ticks--) {
 		const uint64_t cur_ticks = ++audio->buffering_wait_ticks;
 
 		new_ts.end = new_ts.start;
-		new_ts.start = audio->buffered_ts - audio_frames_to_ns(sample_rate, cur_ticks * AUDIO_OUTPUT_FRAMES);
+		new_ts.start = audio->buffered_ts - audio_frames_to_ns(sample_rate, cur_ticks * obs_audio_frames());
 
 #if DEBUG_AUDIO == 1
 		blog(LOG_DEBUG, "add buffered ts: %" PRIu64 "-%" PRIu64, new_ts.start, new_ts.end);
@@ -376,7 +376,7 @@ static void add_audio_buffering(struct obs_core_audio *audio, size_t sample_rate
 
 	offset = ts->start - min_ts;
 	frames = ns_to_audio_frames(sample_rate, offset);
-	ticks = (int)((frames + AUDIO_OUTPUT_FRAMES - 1) / AUDIO_OUTPUT_FRAMES);
+	ticks = (int)((frames + obs_audio_frames() - 1) / obs_audio_frames());
 
 	audio->total_buffering_ticks += ticks;
 
@@ -386,8 +386,8 @@ static void add_audio_buffering(struct obs_core_audio *audio, size_t sample_rate
 		blog(LOG_WARNING, "Max audio buffering reached!");
 	}
 
-	ms = ticks * AUDIO_OUTPUT_FRAMES * 1000 / sample_rate;
-	total_ms = audio->total_buffering_ticks * AUDIO_OUTPUT_FRAMES * 1000 / sample_rate;
+	ms = ticks * obs_audio_frames() * 1000 / sample_rate;
+	total_ms = audio->total_buffering_ticks * obs_audio_frames() * 1000 / sample_rate;
 
 	blog(LOG_INFO,
 	     "adding %d milliseconds of audio buffering, total "
@@ -403,13 +403,13 @@ static void add_audio_buffering(struct obs_core_audio *audio, size_t sample_rate
 #endif
 
 	new_ts.start =
-		audio->buffered_ts - audio_frames_to_ns(sample_rate, audio->buffering_wait_ticks * AUDIO_OUTPUT_FRAMES);
+		audio->buffered_ts - audio_frames_to_ns(sample_rate, audio->buffering_wait_ticks * obs_audio_frames());
 
 	while (ticks--) {
 		const uint64_t cur_ticks = ++audio->buffering_wait_ticks;
 
 		new_ts.end = new_ts.start;
-		new_ts.start = audio->buffered_ts - audio_frames_to_ns(sample_rate, cur_ticks * AUDIO_OUTPUT_FRAMES);
+		new_ts.start = audio->buffered_ts - audio_frames_to_ns(sample_rate, cur_ticks * obs_audio_frames());
 
 #if DEBUG_AUDIO == 1
 		blog(LOG_DEBUG, "add buffered ts: %" PRIu64 "-%" PRIu64, new_ts.start, new_ts.end);
@@ -423,7 +423,7 @@ static void add_audio_buffering(struct obs_core_audio *audio, size_t sample_rate
 
 static bool audio_buffer_insufficient(struct obs_source *source, size_t sample_rate, uint64_t min_ts)
 {
-	size_t total_floats = AUDIO_OUTPUT_FRAMES;
+	size_t total_floats = obs_audio_frames();
 	size_t size;
 
 	if (source->info.audio_render || source->audio_pending || !source->audio_ts) {
@@ -432,7 +432,7 @@ static bool audio_buffer_insufficient(struct obs_source *source, size_t sample_r
 
 	if (source->audio_ts != min_ts && source->audio_ts != (min_ts - 1)) {
 		size_t start_point = convert_time_to_frames(sample_rate, source->audio_ts - min_ts);
-		if (start_point >= AUDIO_OUTPUT_FRAMES)
+		if (start_point >= obs_audio_frames())
 			return false;
 
 		total_floats -= start_point;
@@ -539,7 +539,7 @@ static inline void clear_audio_output_buf(obs_source_t *source, struct obs_core_
 			for (size_t ch = 0; ch < MAX_AUDIO_CHANNELS; ch++) {
 				float *buf = source->audio_output_buf[mix][ch];
 				if (buf)
-					memset(buf, 0, AUDIO_OUTPUT_FRAMES * sizeof(float));
+					memset(buf, 0, obs_audio_frames() * sizeof(float));
 			}
 		}
 	}
@@ -564,7 +564,7 @@ bool audio_callback(void *param, uint64_t start_ts_in, uint64_t end_ts_in, uint6
 	deque_peek_front(&audio->buffered_timestamps, &ts, sizeof(ts));
 	min_ts = ts.start;
 
-	audio_size = AUDIO_OUTPUT_FRAMES * sizeof(float);
+	audio_size = obs_audio_frames() * sizeof(float);
 
 #if DEBUG_AUDIO == 1
 	blog(LOG_DEBUG, "ts %llu-%llu", ts.start, ts.end);

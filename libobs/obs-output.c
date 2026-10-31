@@ -2397,7 +2397,7 @@ static void default_raw_audio_callback(void *param, size_t mix_idx, struct audio
 		output->audio_start_ts = out.timestamp;
 	}
 
-	frame_size_bytes = AUDIO_OUTPUT_FRAMES * output->audio_size;
+	frame_size_bytes = obs_audio_frames() * output->audio_size;
 
 	for (size_t i = 0; i < output->planes; i++)
 		deque_push_back(&output->audio_buffer[mix_idx][i], out.data[i], out.frames * output->audio_size);
@@ -2410,7 +2410,7 @@ static void default_raw_audio_callback(void *param, size_t mix_idx, struct audio
 			out.data[i] = (uint8_t *)output->audio_data[i];
 		}
 
-		out.frames = AUDIO_OUTPUT_FRAMES;
+		out.frames = obs_audio_frames();
 		out.timestamp =
 			output->audio_start_ts + audio_frames_to_ns(output->sample_rate, output->total_audio_frames);
 
@@ -2418,7 +2418,7 @@ static void default_raw_audio_callback(void *param, size_t mix_idx, struct audio
 		out.timestamp += output->pause.ts_offset;
 		pthread_mutex_unlock(&output->pause.mutex);
 
-		output->total_audio_frames += AUDIO_OUTPUT_FRAMES;
+		output->total_audio_frames += obs_audio_frames();
 
 		if (output->info.raw_audio2)
 			output->info.raw_audio2(output->context.data, mix_idx, &out);

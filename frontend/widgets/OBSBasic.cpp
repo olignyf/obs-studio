@@ -1548,9 +1548,19 @@ bool OBSBasic::ResetAudio()
 		ai.speakers = SPEAKERS_STEREO;
 	}
 
+	uint32_t frameSize = audio_output_frames_sanitize(
+		(uint32_t)config_get_uint(App()->GetUserConfig(), "Audio", "AudioFrameSize"));
+	ai.output_frames = frameSize;
+
 	bool lowLatencyAudioBuffering = config_get_bool(App()->GetUserConfig(), "Audio", "LowLatencyAudioBuffering");
 	if (lowLatencyAudioBuffering) {
-		ai.max_buffering_ms = 20;
+		uint32_t rate = ai.samples_per_sec ? ai.samples_per_sec : 48000;
+		uint32_t frameMs = frameSize * 1000 / rate;
+		if (frameMs < 1) {
+			frameMs = 1;
+		}
+		/* One tick of the selected frame size, so a smaller frame is a smaller buffer. */
+		ai.max_buffering_ms = frameMs;
 		ai.fixed_buffering = true;
 	}
 
