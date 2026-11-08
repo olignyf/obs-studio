@@ -88,6 +88,7 @@ typedef struct SRTContext {
 	struct srt_err last_error;
 	/* Listener mode keeps the bound socket and fans each packet out to every accepted caller. */
 	SRTSOCKET listen_fd;
+	int listen_eid;
 	SRTSOCKET clients[SRT_MAX_LISTEN_CLIENTS];
 	int client_count;
 } SRTContext;
@@ -458,6 +459,10 @@ static void libsrt_release_sockets(SRTContext *s, SRTSOCKET *fd)
 		srt_epoll_release(s->eid);
 		s->eid = -1;
 	}
+	if (s->listen_eid >= 0) {
+		srt_epoll_release(s->listen_eid);
+		s->listen_eid = -1;
+	}
 	if (s->listen_fd != SRT_INVALID_SOCK) {
 		srt_close(s->listen_fd);
 		if (fd && *fd == s->listen_fd)
@@ -513,12 +518,29 @@ static int libsrt_add_client(URLContext *h, SRTSOCKET fd)
 	return 0;
 }
 
+/* Non-blocking srt_accept logs an error whenever the queue is empty, so only call it
+ * after the listener reports SRT_EPOLL_IN. */
+static bool libsrt_listener_ready(SRTContext *s)
+{
+	int rnum = 1;
+	int wnum = 1;
+	SRTSOCKET ready[1] = {SRT_INVALID_SOCK};
+	SRTSOCKET error[1] = {SRT_INVALID_SOCK};
+	int ret;
+
+	if (s->listen_eid < 0 || s->client_count >= SRT_MAX_LISTEN_CLIENTS)
+		return false;
+
+	ret = srt_epoll_wait(s->listen_eid, ready, &rnum, error, &wnum, 0, 0, 0, 0, 0);
+	return ret > 0 && rnum > 0;
+}
+
 /* Accept every caller already queued on the listener. EASYNCRCV means the queue is empty. */
 static int libsrt_accept_pending(URLContext *h)
 {
 	SRTContext *s = (SRTContext *)h->priv_data;
 
-	while (s->client_count < SRT_MAX_LISTEN_CLIENTS) {
+	while (libsrt_listener_ready(s)) {
 		SRTSOCKET fd = srt_accept(s->listen_fd, NULL, NULL);
 		int ret;
 		if (fd == SRT_INVALID_SOCK) {
@@ -678,17 +700,16 @@ restart:
 			goto fail1;
 		}
 		s->listen_fd = fd;
+		s->listen_eid = read_eid;
 
 		ret = libsrt_listen(fd, cur_ai->ai_addr, (socklen_t)cur_ai->ai_addrlen, h);
 		if (ret < 0) {
-			srt_epoll_release(read_eid);
 			s->last_error.obs_output_error_number = OBS_OUTPUT_ERROR;
 			goto fail1;
 		}
 
 		/* Block until the first caller so the output stays in "connecting" until someone is watching. */
-		ret = libsrt_network_wait_fd_timeout(h, read_eid, 0, s->listen_timeout, &h->interrupt_callback);
-		srt_epoll_release(read_eid);
+		ret = libsrt_network_wait_fd_timeout(h, s->listen_eid, 0, s->listen_timeout, &h->interrupt_callback);
 		if (ret < 0) {
 			s->last_error.obs_output_error_number = OBS_OUTPUT_ERROR;
 			goto fail1;
@@ -810,6 +831,7 @@ static void libsrt_set_defaults(SRTContext *s)
 	s->tsbpd = -1;
 	s->fd = SRT_INVALID_SOCK;
 	s->eid = -1;
+	s->listen_eid = -1;
 	s->listen_fd = SRT_INVALID_SOCK;
 	s->client_count = 0;
 	for (int i = 0; i < SRT_MAX_LISTEN_CLIENTS; i++)
@@ -1126,6 +1148,10 @@ static int libsrt_close(URLContext *h)
 		for (i = 0; i < s->client_count; i++)
 			libsrt_log_session(s->clients[i]);
 		libsrt_close_all_clients(s, false);
+		if (s->listen_eid >= 0) {
+			srt_epoll_release(s->listen_eid);
+			s->listen_eid = -1;
+		}
 		if (s->listen_fd != SRT_INVALID_SOCK) {
 			srt_close(s->listen_fd);
 			s->listen_fd = SRT_INVALID_SOCK;

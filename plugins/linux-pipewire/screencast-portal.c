@@ -22,6 +22,7 @@
 #include "portal.h"
 
 #include <gio/gunixfdlist.h>
+#include <unistd.h>
 
 enum portal_capture_type {
 	PORTAL_CAPTURE_TYPE_MONITOR = 1 << 0,
@@ -57,7 +58,26 @@ struct screencast_portal_capture {
 
 	obs_pipewire *obs_pw;
 	obs_pipewire_stream *obs_pw_stream;
+
+	GDBusProxy *login_session;
+	bool session_locked;
+	bool restore_after_unlock;
+	int restart_pending;
+	bool destroyed;
+	int reached_streaming;
+	int idle_refs;
+	guint restore_timer;
+	gint64 restore_not_before;
+	gint64 restore_wait_started;
+	bool restore_wait_logged;
 };
+
+/* The portal only skips the share dialog once the saved screen is back in
+ * Mutter's monitor list. Asking in the same moment the lock tears the cast
+ * down makes GNOME show the picker instead. */
+#define SCREENCAST_RESTORE_SETTLE_USEC (2 * G_USEC_PER_SEC)
+#define SCREENCAST_RESTORE_POLL_MS 500
+#define SCREENCAST_RESTORE_GIVE_UP_USEC (120 * G_USEC_PER_SEC)
 
 /* ------------------------------------------------- */
 
@@ -151,6 +171,12 @@ static const char *capture_type_to_string(enum obs_portal_capture_type capture_t
 
 /* ------------------------------------------------- */
 
+static void on_screencast_stream_state(enum pw_stream_state state, void *data);
+static void create_session(struct screencast_portal_capture *capture);
+static void schedule_screencast_restore(struct screencast_portal_capture *capture);
+static void arm_screencast_restore(struct screencast_portal_capture *capture, guint delay_ms);
+static void screencast_restore_failed(struct screencast_portal_capture *capture);
+
 static void on_pipewire_remote_opened_cb(GObject *source, GAsyncResult *res, void *user_data)
 {
 	struct obs_pipewire_connect_stream_info connect_info;
@@ -166,6 +192,7 @@ static void on_pipewire_remote_opened_cb(GObject *source, GAsyncResult *res, voi
 	if (error) {
 		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
 			blog(LOG_ERROR, "[pipewire] Error retrieving pipewire fd: %s", error->message);
+		screencast_restore_failed(capture);
 		return;
 	}
 
@@ -175,18 +202,23 @@ static void on_pipewire_remote_opened_cb(GObject *source, GAsyncResult *res, voi
 	if (error) {
 		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
 			blog(LOG_ERROR, "[pipewire] Error retrieving pipewire fd: %s", error->message);
+		screencast_restore_failed(capture);
 		return;
 	}
 
 	capture->obs_pw = obs_pipewire_connect_fd(pipewire_fd, NULL, NULL);
 
-	if (!capture->obs_pw)
+	if (!capture->obs_pw) {
+		screencast_restore_failed(capture);
 		return;
+	}
 
 	connect_info = (struct obs_pipewire_connect_stream_info){
 		.stream_name = "OBS Studio",
 		.stream_properties = pw_properties_new(PW_KEY_MEDIA_TYPE, "Video", PW_KEY_MEDIA_CATEGORY, "Capture",
 						       PW_KEY_MEDIA_ROLE, "Screen", NULL),
+		.state_callback = on_screencast_stream_state,
+		.state_callback_data = capture,
 		.screencast =
 			{
 				.cursor_visible = capture->cursor_visible,
@@ -225,6 +257,7 @@ static void on_start_response_received_cb(GVariant *parameters, void *user_data)
 
 	if (response != 0) {
 		blog(LOG_WARNING, "[pipewire] Failed to start screencast, denied or cancelled by user");
+		screencast_restore_failed(capture);
 		return;
 	}
 
@@ -271,8 +304,7 @@ static void on_start_response_received_cb(GVariant *parameters, void *user_data)
 
 static void on_started_cb(GObject *source, GAsyncResult *res, void *user_data)
 {
-	UNUSED_PARAMETER(user_data);
-
+	struct screencast_portal_capture *capture = user_data;
 	g_autoptr(GVariant) result = NULL;
 	g_autoptr(GError) error = NULL;
 
@@ -280,6 +312,8 @@ static void on_started_cb(GObject *source, GAsyncResult *res, void *user_data)
 	if (error) {
 		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
 			blog(LOG_ERROR, "[pipewire] Error selecting screencast source: %s", error->message);
+		if (capture)
+			screencast_restore_failed(capture);
 		return;
 	}
 }
@@ -301,7 +335,7 @@ static void start(struct screencast_portal_capture *capture)
 
 	g_dbus_proxy_call(get_screencast_portal_proxy(), "Start",
 			  g_variant_new("(osa{sv})", capture->session_handle, "", &builder), G_DBUS_CALL_FLAGS_NONE, -1,
-			  capture->cancellable, on_started_cb, NULL);
+			  capture->cancellable, on_started_cb, capture);
 
 	bfree(request_token);
 	bfree(request_path);
@@ -321,6 +355,7 @@ static void on_select_source_response_received_cb(GVariant *parameters, void *us
 
 	if (response != 0) {
 		blog(LOG_WARNING, "[pipewire] Failed to select source, denied or cancelled by user");
+		screencast_restore_failed(capture);
 		return;
 	}
 
@@ -329,8 +364,7 @@ static void on_select_source_response_received_cb(GVariant *parameters, void *us
 
 static void on_source_selected_cb(GObject *source, GAsyncResult *res, void *user_data)
 {
-	UNUSED_PARAMETER(user_data);
-
+	struct screencast_portal_capture *capture = user_data;
 	g_autoptr(GVariant) result = NULL;
 	g_autoptr(GError) error = NULL;
 
@@ -338,6 +372,8 @@ static void on_source_selected_cb(GObject *source, GAsyncResult *res, void *user
 	if (error) {
 		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
 			blog(LOG_ERROR, "[pipewire] Error selecting screencast source: %s", error->message);
+		if (capture)
+			screencast_restore_failed(capture);
 		return;
 	}
 }
@@ -379,7 +415,7 @@ static void select_source(struct screencast_portal_capture *capture)
 
 	g_dbus_proxy_call(get_screencast_portal_proxy(), "SelectSources",
 			  g_variant_new("(oa{sv})", capture->session_handle, &builder), G_DBUS_CALL_FLAGS_NONE, -1,
-			  capture->cancellable, on_source_selected_cb, NULL);
+			  capture->cancellable, on_source_selected_cb, capture);
 
 	bfree(request_token);
 	bfree(request_path);
@@ -398,6 +434,7 @@ static void on_create_session_response_received_cb(GVariant *parameters, void *u
 
 	if (response != 0) {
 		blog(LOG_WARNING, "[pipewire] Failed to create session, denied or cancelled by user");
+		screencast_restore_failed(capture);
 		return;
 	}
 
@@ -411,8 +448,7 @@ static void on_create_session_response_received_cb(GVariant *parameters, void *u
 
 static void on_session_created_cb(GObject *source, GAsyncResult *res, void *user_data)
 {
-	UNUSED_PARAMETER(user_data);
-
+	struct screencast_portal_capture *capture = user_data;
 	g_autoptr(GVariant) result = NULL;
 	g_autoptr(GError) error = NULL;
 
@@ -420,6 +456,8 @@ static void on_session_created_cb(GObject *source, GAsyncResult *res, void *user
 	if (error) {
 		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
 			blog(LOG_ERROR, "[pipewire] Error creating screencast session: %s", error->message);
+		if (capture)
+			screencast_restore_failed(capture);
 		return;
 	}
 }
@@ -441,7 +479,7 @@ static void create_session(struct screencast_portal_capture *capture)
 	g_variant_builder_add(&builder, "{sv}", "session_handle_token", g_variant_new_string(session_token));
 
 	g_dbus_proxy_call(get_screencast_portal_proxy(), "CreateSession", g_variant_new("(a{sv})", &builder),
-			  G_DBUS_CALL_FLAGS_NONE, -1, capture->cancellable, on_session_created_cb, NULL);
+			  G_DBUS_CALL_FLAGS_NONE, -1, capture->cancellable, on_session_created_cb, capture);
 
 	bfree(session_token);
 	bfree(request_token);
@@ -449,6 +487,370 @@ static void create_session(struct screencast_portal_capture *capture)
 }
 
 /* ------------------------------------------------- */
+
+static void screencast_restore_failed(struct screencast_portal_capture *capture)
+{
+	g_atomic_int_set(&capture->restart_pending, FALSE);
+}
+
+static void teardown_pipewire_capture(struct screencast_portal_capture *capture)
+{
+	g_clear_pointer(&capture->obs_pw_stream, obs_pipewire_stream_destroy);
+	g_clear_pointer(&capture->obs_pw, obs_pipewire_destroy);
+}
+
+static void close_portal_session(struct screencast_portal_capture *capture)
+{
+	if (!capture->session_handle)
+		return;
+
+	g_dbus_connection_call(portal_get_dbus_connection(), "org.freedesktop.portal.Desktop", capture->session_handle,
+			       "org.freedesktop.portal.Session", "Close", NULL, NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL,
+			       NULL, NULL);
+	g_clear_pointer(&capture->session_handle, g_free);
+}
+
+static void refresh_session_locked(struct screencast_portal_capture *capture)
+{
+	g_autoptr(GVariant) locked = NULL;
+
+	if (!capture->login_session)
+		return;
+
+	locked = g_dbus_proxy_get_cached_property(capture->login_session, "LockedHint");
+	if (locked)
+		capture->session_locked = g_variant_get_boolean(locked);
+}
+
+static bool mutter_has_logical_monitor(bool *known)
+{
+	g_autoptr(GDBusConnection) bus = NULL;
+	g_autoptr(GVariant) state = NULL;
+	g_autoptr(GVariant) logical = NULL;
+	g_autoptr(GError) error = NULL;
+
+	*known = false;
+	bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
+	if (!bus)
+		return false;
+
+	state = g_dbus_connection_call_sync(bus, "org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+					    "org.gnome.Mutter.DisplayConfig", "GetCurrentState", NULL,
+					    G_VARIANT_TYPE("(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})"),
+					    G_DBUS_CALL_FLAGS_NONE, 200, NULL, &error);
+	if (!state)
+		return false;
+
+	*known = true;
+	logical = g_variant_get_child_value(state, 1);
+	return g_variant_n_children(logical) > 0;
+}
+
+static gboolean restore_screencast_idle(gpointer data)
+{
+	struct screencast_portal_capture *capture = data;
+	gint64 now;
+	bool monitors_known = false;
+	bool monitors_ready;
+	bool gave_up;
+
+	if (capture->destroyed)
+		goto done;
+
+	refresh_session_locked(capture);
+
+	if (capture->session_locked) {
+		capture->restore_after_unlock = true;
+		capture->restore_not_before = 0;
+		capture->restore_wait_started = 0;
+		capture->restore_wait_logged = false;
+		goto done;
+	}
+
+	if (g_atomic_int_get(&capture->restart_pending))
+		goto done;
+
+	if (!obs_source_showing(capture->source))
+		goto done;
+
+	if (!g_atomic_int_get(&capture->reached_streaming) && !capture->restore_after_unlock)
+		goto done;
+
+	if (obs_pipewire_stream_accepts_frames(capture->obs_pw_stream))
+		goto done;
+
+	if (!capture->restore_token || !*capture->restore_token) {
+		blog(LOG_WARNING, "[pipewire] Screen capture stopped and there is no restore token");
+		goto done;
+	}
+
+	now = g_get_monotonic_time();
+	if (capture->restore_wait_started == 0)
+		capture->restore_wait_started = now;
+
+	monitors_ready = mutter_has_logical_monitor(&monitors_known);
+	gave_up = now - capture->restore_wait_started >= SCREENCAST_RESTORE_GIVE_UP_USEC;
+	if ((!monitors_known || !monitors_ready) && !gave_up) {
+		capture->restore_after_unlock = true;
+		capture->restore_not_before = 0;
+		if (!capture->restore_wait_logged) {
+			blog(LOG_INFO, "[pipewire] Waiting for the screen to come back before restoring the saved share");
+			capture->restore_wait_logged = true;
+		}
+		arm_screencast_restore(capture, SCREENCAST_RESTORE_POLL_MS);
+		goto done;
+	}
+
+	/* Same token OBS sends on startup. Give Mutter a moment after unlock so
+	 * that token still matches the monitor and the share dialog stays closed. */
+	if (capture->restore_not_before == 0) {
+		capture->restore_not_before = now + SCREENCAST_RESTORE_SETTLE_USEC;
+		arm_screencast_restore(capture, SCREENCAST_RESTORE_SETTLE_USEC / 1000);
+		goto done;
+	}
+	if (now < capture->restore_not_before) {
+		gint64 left_ms = (capture->restore_not_before - now) / 1000;
+
+		arm_screencast_restore(capture, (guint)(left_ms < 1 ? 1 : left_ms));
+		goto done;
+	}
+
+	capture->restore_after_unlock = false;
+	capture->restore_not_before = 0;
+	capture->restore_wait_started = 0;
+	capture->restore_wait_logged = false;
+	g_atomic_int_set(&capture->restart_pending, TRUE);
+	g_atomic_int_set(&capture->reached_streaming, FALSE);
+	blog(LOG_INFO, "[pipewire] Restoring the previously shared screen");
+
+	teardown_pipewire_capture(capture);
+	close_portal_session(capture);
+	create_session(capture);
+
+done:
+	if (g_atomic_int_dec_and_test(&capture->idle_refs) && capture->destroyed)
+		bfree(capture);
+	return G_SOURCE_REMOVE;
+}
+
+static gboolean screencast_restore_timeout(gpointer data)
+{
+	struct screencast_portal_capture *capture = data;
+
+	capture->restore_timer = 0;
+	if (!capture->destroyed)
+		schedule_screencast_restore(capture);
+	return G_SOURCE_REMOVE;
+}
+
+static void arm_screencast_restore(struct screencast_portal_capture *capture, guint delay_ms)
+{
+	if (capture->restore_timer)
+		g_source_remove(capture->restore_timer);
+	capture->restore_timer = g_timeout_add(delay_ms, screencast_restore_timeout, capture);
+}
+
+static void schedule_screencast_restore(struct screencast_portal_capture *capture)
+{
+	g_atomic_int_inc(&capture->idle_refs);
+	g_idle_add(restore_screencast_idle, capture);
+}
+
+static void on_screencast_stream_state(enum pw_stream_state state, void *data)
+{
+	struct screencast_portal_capture *capture = data;
+	int was_streaming = g_atomic_int_get(&capture->reached_streaming);
+
+	if (state == PW_STREAM_STATE_STREAMING) {
+		g_atomic_int_set(&capture->reached_streaming, TRUE);
+		g_atomic_int_set(&capture->restart_pending, FALSE);
+		return;
+	}
+
+	if (was_streaming && (state == PW_STREAM_STATE_PAUSED || state == PW_STREAM_STATE_ERROR ||
+			      state == PW_STREAM_STATE_UNCONNECTED))
+		schedule_screencast_restore(capture);
+}
+
+static void on_login_session_properties_changed(GDBusProxy *proxy, GVariant *changed_properties,
+						const char **invalidated_properties, gpointer user_data)
+{
+	struct screencast_portal_capture *capture = user_data;
+	gboolean locked = FALSE;
+
+	UNUSED_PARAMETER(proxy);
+	UNUSED_PARAMETER(invalidated_properties);
+
+	if (!g_variant_lookup(changed_properties, "LockedHint", "b", &locked))
+		return;
+
+	capture->session_locked = locked;
+	if (locked) {
+		blog(LOG_INFO, "[pipewire] Session locked, screen capture will resume on unlock");
+		return;
+	}
+
+	blog(LOG_INFO, "[pipewire] Session unlocked");
+	if (!obs_pipewire_stream_accepts_frames(capture->obs_pw_stream))
+		g_atomic_int_set(&capture->restart_pending, FALSE);
+	schedule_screencast_restore(capture);
+}
+
+static GDBusProxy *login_session_proxy_new(GDBusConnection *bus, const char *path)
+{
+	g_autoptr(GError) error = NULL;
+	GDBusProxy *proxy;
+
+	proxy = g_dbus_proxy_new_sync(bus, G_DBUS_PROXY_FLAGS_NONE, NULL, "org.freedesktop.login1", path,
+				      "org.freedesktop.login1.Session", NULL, &error);
+	if (!proxy)
+		blog(LOG_WARNING, "[pipewire] Could not open login session %s: %s", path, error->message);
+	return proxy;
+}
+
+static bool is_graphical_user_session(GDBusProxy *proxy)
+{
+	g_autoptr(GVariant) session_class = NULL;
+	g_autoptr(GVariant) session_type = NULL;
+	const char *class_str;
+	const char *type_str;
+
+	session_class = g_dbus_proxy_get_cached_property(proxy, "Class");
+	session_type = g_dbus_proxy_get_cached_property(proxy, "Type");
+	class_str = session_class ? g_variant_get_string(session_class, NULL) : NULL;
+	type_str = session_type ? g_variant_get_string(session_type, NULL) : NULL;
+
+	if (g_strcmp0(class_str, "user") != 0)
+		return false;
+	return g_strcmp0(type_str, "x11") == 0 || g_strcmp0(type_str, "wayland") == 0;
+}
+
+static GDBusProxy *take_if_graphical_session(GDBusConnection *bus, const char *path)
+{
+	GDBusProxy *proxy = login_session_proxy_new(bus, path);
+
+	if (proxy && !is_graphical_user_session(proxy))
+		g_clear_object(&proxy);
+	return proxy;
+}
+
+/* OBS started from a terminal is in the user slice, not the seat session, so
+ * GetSessionByPID fails. The share dialog is tied to the graphical session. */
+static GDBusProxy *find_graphical_login_session(GDBusConnection *bus, GDBusProxy *manager)
+{
+	g_autoptr(GVariant) by_pid = NULL;
+	g_autoptr(GVariant) listed = NULL;
+	g_autoptr(GVariant) sessions = NULL;
+	GVariantIter iter;
+	const char *id;
+	const char *user;
+	const char *seat;
+	const char *path;
+	const char *env_id;
+	guint32 uid;
+	GDBusProxy *fallback = NULL;
+
+	by_pid = g_dbus_proxy_call_sync(manager, "GetSessionByPID", g_variant_new("(u)", (guint32)getpid()),
+					G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL);
+	if (by_pid) {
+		GDBusProxy *proxy;
+
+		g_variant_get(by_pid, "(o)", &path);
+		proxy = take_if_graphical_session(bus, path);
+		if (proxy)
+			return proxy;
+	}
+
+	env_id = getenv("XDG_SESSION_ID");
+	if (env_id && *env_id) {
+		g_autoptr(GVariant) by_id = NULL;
+
+		by_id = g_dbus_proxy_call_sync(manager, "GetSession", g_variant_new("(s)", env_id),
+					       G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL);
+		if (by_id) {
+			GDBusProxy *proxy;
+
+			g_variant_get(by_id, "(o)", &path);
+			proxy = take_if_graphical_session(bus, path);
+			if (proxy)
+				return proxy;
+		}
+	}
+
+	listed = g_dbus_proxy_call_sync(manager, "ListSessions", NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL);
+	if (!listed)
+		return NULL;
+
+	sessions = g_variant_get_child_value(listed, 0);
+	g_variant_iter_init(&iter, sessions);
+	while (g_variant_iter_next(&iter, "(susso)", &id, &uid, &user, &seat, &path)) {
+		GDBusProxy *proxy;
+		g_autoptr(GVariant) active = NULL;
+
+		UNUSED_PARAMETER(id);
+		UNUSED_PARAMETER(user);
+		UNUSED_PARAMETER(seat);
+
+		if (uid != (guint32)getuid())
+			continue;
+
+		proxy = take_if_graphical_session(bus, path);
+		if (!proxy)
+			continue;
+
+		active = g_dbus_proxy_get_cached_property(proxy, "Active");
+		if (active && g_variant_get_boolean(active)) {
+			g_clear_object(&fallback);
+			return proxy;
+		}
+
+		if (!fallback)
+			fallback = proxy;
+		else
+			g_object_unref(proxy);
+	}
+
+	return fallback;
+}
+
+static void watch_session_lock(struct screencast_portal_capture *capture)
+{
+	g_autoptr(GDBusConnection) system_bus = NULL;
+	g_autoptr(GDBusProxy) manager = NULL;
+	g_autoptr(GError) error = NULL;
+	g_autoptr(GVariant) session_id = NULL;
+	const char *id = NULL;
+
+	system_bus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, &error);
+	if (!system_bus) {
+		blog(LOG_WARNING, "[pipewire] Could not watch session lock: %s", error->message);
+		return;
+	}
+
+	manager = g_dbus_proxy_new_sync(system_bus, G_DBUS_PROXY_FLAGS_DO_NOT_CONNECT_SIGNALS, NULL,
+					"org.freedesktop.login1", "/org/freedesktop/login1",
+					"org.freedesktop.login1.Manager", NULL, &error);
+	if (!manager) {
+		blog(LOG_WARNING, "[pipewire] Could not watch session lock: %s", error->message);
+		return;
+	}
+
+	capture->login_session = find_graphical_login_session(system_bus, manager);
+	if (!capture->login_session) {
+		blog(LOG_WARNING, "[pipewire] Could not watch session lock: no graphical login session");
+		return;
+	}
+
+	session_id = g_dbus_proxy_get_cached_property(capture->login_session, "Id");
+	if (session_id)
+		id = g_variant_get_string(session_id, NULL);
+	blog(LOG_INFO, "[pipewire] Watching screen lock on session %s", id ? id : "?");
+
+	refresh_session_locked(capture);
+
+	g_signal_connect(capture->login_session, "g-properties-changed", G_CALLBACK(on_login_session_properties_changed),
+			 capture);
+}
 
 static gboolean init_screencast_capture(struct screencast_portal_capture *capture)
 {
@@ -464,6 +866,9 @@ static gboolean init_screencast_capture(struct screencast_portal_capture *captur
 		return FALSE;
 
 	blog(LOG_INFO, "PipeWire initialized");
+
+	if (!capture->login_session)
+		watch_session_lock(capture);
 
 	create_session(capture);
 
@@ -560,21 +965,27 @@ static void screencast_portal_capture_destroy(void *data)
 	if (!capture)
 		return;
 
-	if (capture->session_handle) {
-		g_dbus_connection_call(portal_get_dbus_connection(), "org.freedesktop.portal.Desktop",
-				       capture->session_handle, "org.freedesktop.portal.Session", "Close", NULL, NULL,
-				       G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL, NULL);
+	capture->destroyed = true;
 
-		g_clear_pointer(&capture->session_handle, g_free);
+	if (capture->restore_timer) {
+		g_source_remove(capture->restore_timer);
+		capture->restore_timer = 0;
 	}
+
+	if (capture->login_session) {
+		g_signal_handlers_disconnect_by_data(capture->login_session, capture);
+		g_clear_object(&capture->login_session);
+	}
+
+	close_portal_session(capture);
 
 	g_clear_pointer(&capture->restore_token, bfree);
 
-	g_clear_pointer(&capture->obs_pw_stream, obs_pipewire_stream_destroy);
-	obs_pipewire_destroy(capture->obs_pw);
+	teardown_pipewire_capture(capture);
 	g_cancellable_cancel(capture->cancellable);
 	g_clear_object(&capture->cancellable);
-	bfree(capture);
+	if (g_atomic_int_get(&capture->idle_refs) == 0)
+		bfree(capture);
 }
 
 static void screencast_portal_capture_save(void *data, obs_data_t *settings)
@@ -633,6 +1044,8 @@ static void screencast_portal_capture_show(void *data)
 
 	if (capture->obs_pw_stream)
 		obs_pipewire_stream_show(capture->obs_pw_stream);
+	if (capture->restore_after_unlock)
+		schedule_screencast_restore(capture);
 }
 
 static void screencast_portal_capture_hide(void *data)

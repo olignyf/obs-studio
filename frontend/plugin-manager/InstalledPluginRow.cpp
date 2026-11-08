@@ -22,7 +22,7 @@
 
 #include <Idian/InlineButton.hpp>
 
-constexpr std::string_view kLegacyPluginInfoLink{"https://obsproject.com/go/legacy-plugin-locations"};
+constexpr QLatin1String kLegacyPluginInfoLink{"https://obsproject.com/go/legacy-plugin-locations"};
 
 namespace OBS {
 InstalledPluginRow::InstalledPluginRow(QWidget *parent, const PluginManagerWindow::Entry &entry) : idian::Row(parent)

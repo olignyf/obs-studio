@@ -23,12 +23,16 @@
 #include "formats.h"
 
 #include <util/darray.h>
+#include <util/platform.h>
 
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
 #include <glib/gstdio.h>
 
 #include <fcntl.h>
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <time.h>
 #include <glad/glad.h>
 #include <libdrm/drm_fourcc.h>
 #include <pipewire/pipewire.h>
@@ -40,6 +44,66 @@
 #include <spa/utils/result.h>
 
 //#define DEBUG_PIPEWIRE
+
+/* Sakamoto day-of-week: 0 = Sunday. */
+static int pw_ymd_dow(int year, int month, int day)
+{
+	static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+	if (month < 3)
+		year -= 1;
+	return (year + year / 4 - year / 100 + year / 400 + t[month - 1] + day) % 7;
+}
+
+static int pw_nth_sunday(int year, int month, int n)
+{
+	int first = pw_ymd_dow(year, month, 1);
+	int day = 1 + (7 - first) % 7;
+	return day + (n - 1) * 7;
+}
+
+/* US Eastern time. DST starts 07:00 UTC on the second Sunday of March and ends 06:00 UTC on the first Sunday of November. */
+static void pw_ny_timestamp(char *buf, size_t len)
+{
+	time_t now = time(NULL);
+	struct tm utc;
+	bool edt;
+	int start_day;
+	int end_day;
+	int month;
+	time_t local;
+	struct tm ny;
+
+	gmtime_r(&now, &utc);
+	start_day = pw_nth_sunday(utc.tm_year + 1900, 3, 2);
+	end_day = pw_nth_sunday(utc.tm_year + 1900, 11, 1);
+	month = utc.tm_mon + 1;
+	edt = false;
+	if (month > 3 && month < 11) {
+		edt = true;
+	} else if (month == 3) {
+		edt = utc.tm_mday > start_day || (utc.tm_mday == start_day && utc.tm_hour >= 7);
+	} else if (month == 11) {
+		edt = utc.tm_mday < end_day || (utc.tm_mday == end_day && utc.tm_hour < 6);
+	}
+
+	local = now + (edt ? -4 : -5) * 3600;
+	gmtime_r(&local, &ny);
+	snprintf(buf, len, "%04d-%02d-%02d %02d:%02d:%02d %s", ny.tm_year + 1900, ny.tm_mon + 1, ny.tm_mday, ny.tm_hour,
+		 ny.tm_min, ny.tm_sec, edt ? "EDT" : "EST");
+}
+
+static void pw_blog(int level, const char *fmt, ...)
+{
+	char ts[40];
+	char msg[1024];
+	va_list ap;
+
+	pw_ny_timestamp(ts, sizeof(ts));
+	va_start(ap, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, ap);
+	va_end(ap);
+	blog(level, "%s %s", ts, msg);
+}
 
 #if !PW_CHECK_VERSION(0, 3, 62)
 enum spa_meta_videotransform_value {
@@ -147,6 +211,21 @@ struct _obs_pipewire_stream {
 		bool release_point_will_signal;
 		bool set;
 	} sync;
+
+	void (*state_callback)(enum pw_stream_state state, void *data);
+	void *state_callback_data;
+
+	struct spa_source *health_timer;
+	struct {
+		_Atomic uint64_t process_calls;
+		_Atomic uint64_t frames;
+		_Atomic uint64_t empty_dequeue;
+		_Atomic uint64_t empty_chunk;
+		_Atomic uint64_t corrupt;
+		_Atomic uint64_t texture_fail;
+		_Atomic uint64_t last_frame_ns;
+		_Atomic uint64_t last_process_ns;
+	} stats;
 };
 
 /* auxiliary methods */
@@ -168,12 +247,12 @@ static bool check_pw_version(const struct obs_pw_version *pw_version, int major,
 
 static void update_pw_versions(obs_pipewire *obs_pw, const char *version)
 {
-	blog(LOG_INFO, "[pipewire] Server version: %s", version);
-	blog(LOG_INFO, "[pipewire] Library version: %s", pw_get_library_version());
-	blog(LOG_INFO, "[pipewire] Header version: %s", pw_get_headers_version());
+	pw_blog(LOG_INFO, "[pipewire] Server version: %s", version);
+	pw_blog(LOG_INFO, "[pipewire] Library version: %s", pw_get_library_version());
+	pw_blog(LOG_INFO, "[pipewire] Header version: %s", pw_get_headers_version());
 
 	if (!parse_pw_version(&obs_pw->server_version, version))
-		blog(LOG_WARNING, "[pipewire] failed to parse server version");
+		pw_blog(LOG_WARNING, "[pipewire] failed to parse server version");
 }
 
 static void teardown_pipewire(obs_pipewire *obs_pw)
@@ -378,14 +457,14 @@ static bool build_format_params(obs_pipewire_stream *obs_pw_stream, struct spa_p
 	const struct spa_pod **params;
 
 	if (!obs_pw_stream->format_info.num) {
-		blog(LOG_ERROR, "[pipewire] No format found while building param pointers");
+		pw_blog(LOG_ERROR, "[pipewire] No format found while building param pointers");
 		return false;
 	}
 
 	params = bzalloc(2 * obs_pw_stream->format_info.num * sizeof(struct spa_pod *));
 
 	if (!params) {
-		blog(LOG_ERROR, "[pipewire] Failed to allocate memory for param pointers");
+		pw_blog(LOG_ERROR, "[pipewire] Failed to allocate memory for param pointers");
 		return false;
 	}
 
@@ -546,7 +625,7 @@ static void renegotiate_format(void *data, uint64_t expirations)
 	obs_pipewire *obs_pw = obs_pw_stream->obs_pw;
 	const struct spa_pod **params = NULL;
 
-	blog(LOG_INFO, "[pipewire] Renegotiating stream");
+	pw_blog(LOG_INFO, "[pipewire] Renegotiating stream");
 
 	pw_thread_loop_lock(obs_pw->thread_loop);
 
@@ -666,43 +745,49 @@ static void process_video_async(obs_pipewire_stream *obs_pw_stream)
 
 	b = find_latest_buffer(obs_pw_stream->stream);
 	if (!b) {
-		blog(LOG_DEBUG, "[pipewire] Out of buffers!");
+		atomic_fetch_add(&obs_pw_stream->stats.empty_dequeue, 1);
 		return;
 	}
 
 	buffer = b->buffer;
 	has_buffer = buffer->datas[0].chunk->size != 0;
 
-	if (!has_buffer)
+	if (!has_buffer) {
+		atomic_fetch_add(&obs_pw_stream->stats.empty_chunk, 1);
 		goto done;
+	}
 
 #ifdef DEBUG_PIPEWIRE
-	blog(LOG_DEBUG, "[pipewire] Buffer has memory texture");
+	pw_blog(LOG_DEBUG, "[pipewire] Buffer has memory texture (async)");
 #endif
 
 	struct obs_source_frame out = {0};
 	if (!prepare_obs_frame(obs_pw_stream, &out)) {
-		blog(LOG_ERROR, "[pipewire] Couldn't prepare frame");
+		atomic_fetch_add(&obs_pw_stream->stats.texture_fail, 1);
+		pw_blog(LOG_ERROR, "[pipewire] Couldn't prepare frame");
 		goto done;
 	}
 
 	for (uint32_t i = 0; i < buffer->n_datas && i < MAX_AV_PLANES; i++) {
 		out.data[i] = buffer->datas[i].data;
 		if (out.data[i] == NULL) {
-			blog(LOG_ERROR, "[pipewire] Failed to access data");
+			atomic_fetch_add(&obs_pw_stream->stats.texture_fail, 1);
+			pw_blog(LOG_ERROR, "[pipewire] Failed to access data");
 			goto done;
 		}
 	}
 
 #ifdef DEBUG_PIPEWIRE
-	blog(LOG_DEBUG, "[pipewire] Frame info: Format: %s, Planes: %u", get_video_format_name(out.format),
+	pw_blog(LOG_DEBUG, "[pipewire] Frame info: Format: %s, Planes: %u", get_video_format_name(out.format),
 	     buffer->n_datas);
 	for (uint32_t i = 0; i < buffer->n_datas && i < MAX_AV_PLANES; i++) {
-		blog(LOG_DEBUG, "[pipewire] Plane %u: Dataptr:%p, Linesize:%d", i, out.data[i], out.linesize[i]);
+		pw_blog(LOG_DEBUG, "[pipewire] Plane %u: Dataptr:%p, Linesize:%d", i, out.data[i], out.linesize[i]);
 	}
 #endif
 
 	obs_source_output_video(obs_pw_stream->source, &out);
+	atomic_fetch_add(&obs_pw_stream->stats.frames, 1);
+	atomic_store(&obs_pw_stream->stats.last_frame_ns, os_gettime_ns());
 
 done:
 	pw_stream_queue_buffer(obs_pw_stream->stream, b);
@@ -722,14 +807,15 @@ static void process_video_sync(obs_pipewire_stream *obs_pw_stream)
 
 	b = find_latest_buffer(obs_pw_stream->stream);
 	if (!b) {
-		blog(LOG_DEBUG, "[pipewire] Out of buffers!");
+		atomic_fetch_add(&obs_pw_stream->stats.empty_dequeue, 1);
 		return;
 	}
 
 	buffer = b->buffer;
 	header = spa_buffer_find_meta_data(buffer, SPA_META_Header, sizeof(*header));
 	if (header && (header->flags & SPA_META_HEADER_FLAG_CORRUPTED) > 0) {
-		blog(LOG_ERROR, "[pipewire] buffer is corrupt");
+		atomic_fetch_add(&obs_pw_stream->stats.corrupt, 1);
+		pw_blog(LOG_ERROR, "[pipewire] buffer is corrupt");
 		return_unused_pw_buffer(obs_pw_stream->stream, b);
 		return;
 	}
@@ -740,8 +826,10 @@ static void process_video_sync(obs_pipewire_stream *obs_pw_stream)
 	// Workaround for mutter behaviour pre GNOME 43
 	// Only check this if !SPA_META_Header, once supported platforms update.
 	has_buffer = buffer->datas[0].chunk->size != 0;
-	if (!has_buffer)
+	if (!has_buffer) {
+		atomic_fetch_add(&obs_pw_stream->stats.empty_chunk, 1);
 		goto read_metadata;
+	}
 
 	if (buffer->datas[0].type == SPA_DATA_DmaBuf) {
 		uint32_t planes = get_spa_buffer_plane_count(buffer);
@@ -757,14 +845,15 @@ static void process_video_sync(obs_pipewire_stream *obs_pw_stream)
 #endif
 
 #ifdef DEBUG_PIPEWIRE
-		blog(LOG_DEBUG, "[pipewire] DMA-BUF info: fd:%ld, stride:%d, offset:%u, size:%dx%d",
+		pw_blog(LOG_DEBUG, "[pipewire] DMA-BUF info: fd:%ld, stride:%d, offset:%u, size:%dx%d",
 		     buffer->datas[0].fd, buffer->datas[0].chunk->stride, buffer->datas[0].chunk->offset,
 		     obs_pw_stream->format.info.raw.size.width, obs_pw_stream->format.info.raw.size.height);
 #endif
 
 		if (!obs_pw_video_format_from_spa_format(obs_pw_stream->format.info.raw.format, &obs_pw_video_format) ||
 		    obs_pw_video_format.gs_format == GS_UNKNOWN) {
-			blog(LOG_ERROR, "[pipewire] unsupported DMA buffer format: %d",
+			atomic_fetch_add(&obs_pw_stream->stats.texture_fail, 1);
+			pw_blog(LOG_ERROR, "[pipewire] unsupported DMA buffer format: %d",
 			     obs_pw_stream->format.info.raw.format);
 			goto read_metadata;
 		}
@@ -810,7 +899,8 @@ static void process_video_sync(obs_pipewire_stream *obs_pw_stream)
 #endif
 
 		if (corrupt) {
-			blog(LOG_DEBUG, "[pipewire] buffer contains corrupted data");
+			atomic_fetch_add(&obs_pw_stream->stats.corrupt, 1);
+			pw_blog(LOG_DEBUG, "[pipewire] buffer contains corrupted data");
 			goto read_metadata;
 		}
 
@@ -824,28 +914,36 @@ static void process_video_sync(obs_pipewire_stream *obs_pw_stream)
 								       use_modifiers ? modifiers : NULL);
 
 		if (obs_pw_stream->texture == NULL) {
+			atomic_fetch_add(&obs_pw_stream->stats.texture_fail, 1);
 			remove_modifier_from_format(obs_pw_stream, obs_pw_stream->format.info.raw.format,
 						    obs_pw_stream->format.info.raw.modifier);
 			pw_loop_signal_event(pw_thread_loop_get_loop(obs_pw->thread_loop), obs_pw_stream->reneg);
 			goto read_metadata;
 		}
+		atomic_fetch_add(&obs_pw_stream->stats.frames, 1);
+		atomic_store(&obs_pw_stream->stats.last_frame_ns, os_gettime_ns());
 	} else {
-		blog(LOG_DEBUG, "[pipewire] Buffer has memory texture");
+#ifdef DEBUG_PIPEWIRE
+		pw_blog(LOG_DEBUG, "[pipewire] Buffer has memory texture (sync)");
+#endif
 
 		if (!obs_pw_video_format_from_spa_format(obs_pw_stream->format.info.raw.format, &obs_pw_video_format) ||
 		    obs_pw_video_format.gs_format == GS_UNKNOWN) {
-			blog(LOG_ERROR, "[pipewire] unsupported buffer format: %d",
+			atomic_fetch_add(&obs_pw_stream->stats.texture_fail, 1);
+			pw_blog(LOG_ERROR, "[pipewire] unsupported buffer format: %d",
 			     obs_pw_stream->format.info.raw.format);
 			goto read_metadata;
 		}
 
 		if ((buffer->datas[0].chunk->flags & SPA_CHUNK_FLAG_CORRUPTED) > 0) {
-			blog(LOG_DEBUG, "[pipewire] buffer contains corrupted data");
+			atomic_fetch_add(&obs_pw_stream->stats.corrupt, 1);
+			pw_blog(LOG_DEBUG, "[pipewire] buffer contains corrupted data");
 			goto read_metadata;
 		}
 
 		if (buffer->datas[0].chunk->size == 0) {
-			blog(LOG_DEBUG, "[pipewire] buffer contains empty data");
+			atomic_fetch_add(&obs_pw_stream->stats.empty_chunk, 1);
+			pw_blog(LOG_DEBUG, "[pipewire] buffer contains empty data");
 			goto read_metadata;
 		}
 
@@ -854,6 +952,12 @@ static void process_video_sync(obs_pipewire_stream *obs_pw_stream)
 							   obs_pw_stream->format.info.raw.size.height,
 							   obs_pw_video_format.gs_format, 1,
 							   (const uint8_t **)&buffer->datas[0].data, GS_DYNAMIC);
+		if (!obs_pw_stream->texture)
+			atomic_fetch_add(&obs_pw_stream->stats.texture_fail, 1);
+		else {
+			atomic_fetch_add(&obs_pw_stream->stats.frames, 1);
+			atomic_store(&obs_pw_stream->stats.last_frame_ns, os_gettime_ns());
+		}
 	}
 
 	if (obs_pw_video_format.swap_red_blue)
@@ -863,7 +967,7 @@ static void process_video_sync(obs_pipewire_stream *obs_pw_stream)
 	region = spa_buffer_find_meta_data(buffer, SPA_META_VideoCrop, sizeof(*region));
 	if (region && spa_meta_region_is_valid(region)) {
 #ifdef DEBUG_PIPEWIRE
-		blog(LOG_DEBUG, "[pipewire] Crop Region available (%dx%d+%d+%d)", region->region.position.x,
+		pw_blog(LOG_DEBUG, "[pipewire] Crop Region available (%dx%d+%d+%d)", region->region.position.x,
 		     region->region.position.y, region->region.size.width, region->region.size.height);
 #endif
 
@@ -931,6 +1035,9 @@ static void on_process_cb(void *user_data)
 	obs_pipewire_stream *obs_pw_stream = user_data;
 	uint32_t output_flags;
 
+	atomic_fetch_add(&obs_pw_stream->stats.process_calls, 1);
+	atomic_store(&obs_pw_stream->stats.last_process_ns, os_gettime_ns());
+
 	output_flags = obs_source_get_output_flags(obs_pw_stream->source);
 
 	if (output_flags & OBS_SOURCE_VIDEO) {
@@ -984,20 +1091,20 @@ static void on_param_changed_cb(void *user_data, uint32_t id, const struct spa_p
 #endif
 	}
 
-	blog(LOG_INFO, "[pipewire] Negotiated format:");
+	pw_blog(LOG_INFO, "[pipewire] Negotiated format:");
 
 	format_name = spa_debug_type_find_name(spa_type_video_format, obs_pw_stream->format.info.raw.format);
-	blog(LOG_INFO, "[pipewire]     Format: %d (%s)", obs_pw_stream->format.info.raw.format,
+	pw_blog(LOG_INFO, "[pipewire]     Format: %d (%s)", obs_pw_stream->format.info.raw.format,
 	     format_name ? format_name : "unknown format");
 
 	if (has_modifier) {
-		blog(LOG_INFO, "[pipewire]     Modifier: 0x%" PRIx64, obs_pw_stream->format.info.raw.modifier);
+		pw_blog(LOG_INFO, "[pipewire]     Modifier: 0x%" PRIx64, obs_pw_stream->format.info.raw.modifier);
 	}
 
-	blog(LOG_INFO, "[pipewire]     Size: %dx%d", obs_pw_stream->format.info.raw.size.width,
+	pw_blog(LOG_INFO, "[pipewire]     Size: %dx%d", obs_pw_stream->format.info.raw.size.width,
 	     obs_pw_stream->format.info.raw.size.height);
 
-	blog(LOG_INFO, "[pipewire]     Framerate: %d/%d", obs_pw_stream->format.info.raw.framerate.num,
+	pw_blog(LOG_INFO, "[pipewire]     Framerate: %d/%d", obs_pw_stream->format.info.raw.framerate.num,
 	     obs_pw_stream->format.info.raw.framerate.denom);
 
 	/* Video crop */
@@ -1062,6 +1169,42 @@ static void on_param_changed_cb(void *user_data, uint32_t id, const struct spa_p
 	obs_pw_stream->negotiated = true;
 }
 
+static void pw_capture_health(void *data, uint64_t expirations)
+{
+	obs_pipewire_stream *obs_pw_stream = data;
+	uint64_t now = os_gettime_ns();
+	uint64_t last_frame = atomic_load(&obs_pw_stream->stats.last_frame_ns);
+	uint64_t last_process = atomic_load(&obs_pw_stream->stats.last_process_ns);
+	double since_frame = last_frame ? (double)(now - last_frame) / 1000000000.0 : -1.0;
+	double since_process = last_process ? (double)(now - last_process) / 1000000000.0 : -1.0;
+	const char *error = NULL;
+	enum pw_stream_state state = PW_STREAM_STATE_UNCONNECTED;
+	bool stalled;
+
+	UNUSED_PARAMETER(expirations);
+
+	if (obs_pw_stream->stream)
+		state = pw_stream_get_state(obs_pw_stream->stream, &error);
+
+	/* Preview keeps the last texture, so a quiet stream looks like a frozen frame. */
+	stalled = obs_pw_stream->negotiated &&
+		  (last_frame == 0 || since_frame > 5.0 || last_process == 0 || since_process > 5.0);
+
+	pw_blog(stalled ? LOG_WARNING : LOG_INFO,
+		"[pipewire] capture %s source='%s' stream=%p state=%s error=%s since_frame=%.1fs since_process=%.1fs "
+		"process=%llu frames=%llu empty_dequeue=%llu empty_chunk=%llu corrupt=%llu texture_fail=%llu size=%ux%u",
+		stalled ? "STALLED" : "ok", obs_pw_stream->source ? obs_source_get_name(obs_pw_stream->source) : "(none)",
+		obs_pw_stream->stream, pw_stream_state_as_string(state), error ? error : "none", since_frame,
+		since_process, (unsigned long long)atomic_load(&obs_pw_stream->stats.process_calls),
+		(unsigned long long)atomic_load(&obs_pw_stream->stats.frames),
+		(unsigned long long)atomic_load(&obs_pw_stream->stats.empty_dequeue),
+		(unsigned long long)atomic_load(&obs_pw_stream->stats.empty_chunk),
+		(unsigned long long)atomic_load(&obs_pw_stream->stats.corrupt),
+		(unsigned long long)atomic_load(&obs_pw_stream->stats.texture_fail),
+		obs_pw_stream->negotiated ? obs_pw_stream->format.info.raw.size.width : 0,
+		obs_pw_stream->negotiated ? obs_pw_stream->format.info.raw.size.height : 0);
+}
+
 static void on_state_changed_cb(void *user_data, enum pw_stream_state old, enum pw_stream_state state,
 				const char *error)
 {
@@ -1069,8 +1212,11 @@ static void on_state_changed_cb(void *user_data, enum pw_stream_state old, enum 
 
 	obs_pipewire_stream *obs_pw_stream = user_data;
 
-	blog(LOG_INFO, "[pipewire] Stream %p state: \"%s\" (error: %s)", obs_pw_stream->stream,
+	pw_blog(LOG_INFO, "[pipewire] Stream %p state: \"%s\" (error: %s)", obs_pw_stream->stream,
 	     pw_stream_state_as_string(state), error ? error : "none");
+
+	if (obs_pw_stream->state_callback)
+		obs_pw_stream->state_callback(state, obs_pw_stream->state_callback_data);
 }
 
 static const struct pw_stream_events stream_events = {
@@ -1091,7 +1237,7 @@ static void on_core_error_cb(void *user_data, uint32_t id, int seq, int res, con
 {
 	obs_pipewire *obs_pw = user_data;
 
-	blog(LOG_ERROR, "[pipewire] Error id:%u seq:%d res:%d (%s): %s", id, seq, res, spa_strerror(res), message);
+	pw_blog(LOG_ERROR, "[pipewire] Error id:%u seq:%d res:%d (%s): %s", id, seq, res, spa_strerror(res), message);
 
 	pw_thread_loop_signal(obs_pw->thread_loop, FALSE);
 }
@@ -1124,7 +1270,7 @@ obs_pipewire *obs_pipewire_connect_fd(int pipewire_fd, const struct pw_registry_
 	obs_pw->context = pw_context_new(pw_thread_loop_get_loop(obs_pw->thread_loop), NULL, 0);
 
 	if (pw_thread_loop_start(obs_pw->thread_loop) < 0) {
-		blog(LOG_WARNING, "Error starting threaded mainloop");
+		pw_blog(LOG_WARNING, "Error starting threaded mainloop");
 		bfree(obs_pw);
 		return NULL;
 	}
@@ -1134,7 +1280,7 @@ obs_pipewire *obs_pipewire_connect_fd(int pipewire_fd, const struct pw_registry_
 	/* Core */
 	obs_pw->core = pw_context_connect_fd(obs_pw->context, fcntl(obs_pw->pipewire_fd, F_DUPFD_CLOEXEC, 5), NULL, 0);
 	if (!obs_pw->core) {
-		blog(LOG_WARNING, "Error creating PipeWire core: %m");
+		pw_blog(LOG_WARNING, "Error creating PipeWire core: %m");
 		pw_thread_loop_unlock(obs_pw->thread_loop);
 		bfree(obs_pw);
 		return NULL;
@@ -1150,7 +1296,7 @@ obs_pipewire *obs_pipewire_connect_fd(int pipewire_fd, const struct pw_registry_
 	if (registry_events) {
 		obs_pw->registry = pw_core_get_registry(obs_pw->core, PW_VERSION_REGISTRY, 0);
 		pw_registry_add_listener(obs_pw->registry, &obs_pw->registry_listener, registry_events, user_data);
-		blog(LOG_INFO, "[pipewire] Created registry %p", obs_pw->registry);
+		pw_blog(LOG_INFO, "[pipewire] Created registry %p", obs_pw->registry);
 	}
 
 	pw_thread_loop_unlock(obs_pw->thread_loop);
@@ -1208,6 +1354,8 @@ obs_pipewire_stream *obs_pipewire_connect_stream(obs_pipewire *obs_pw, obs_sourc
 	obs_pw_stream->resolution.set = connect_info->video.resolution != NULL;
 	obs_pw_stream->sync.acquire_syncobj_fd = -1;
 	obs_pw_stream->sync.release_syncobj_fd = -1;
+	obs_pw_stream->state_callback = connect_info->state_callback;
+	obs_pw_stream->state_callback_data = connect_info->state_callback_data;
 
 	if (obs_pw_stream->framerate.set)
 		obs_pw_stream->framerate.fraction = *connect_info->video.framerate;
@@ -1222,12 +1370,12 @@ obs_pipewire_stream *obs_pipewire_connect_stream(obs_pipewire *obs_pw, obs_sourc
 	/* Signal to renegotiate */
 	obs_pw_stream->reneg =
 		pw_loop_add_event(pw_thread_loop_get_loop(obs_pw->thread_loop), renegotiate_format, obs_pw_stream);
-	blog(LOG_DEBUG, "[pipewire] registered event %p", obs_pw_stream->reneg);
+	pw_blog(LOG_DEBUG, "[pipewire] registered event %p", obs_pw_stream->reneg);
 
 	/* Stream */
 	obs_pw_stream->stream = pw_stream_new(obs_pw->core, connect_info->stream_name, connect_info->stream_properties);
 	pw_stream_add_listener(obs_pw_stream->stream, &obs_pw_stream->stream_listener, &stream_events, obs_pw_stream);
-	blog(LOG_INFO, "[pipewire] Created stream %p", obs_pw_stream->stream);
+	pw_blog(LOG_INFO, "[pipewire] Created stream %p", obs_pw_stream->stream);
 
 	/* Stream parameters */
 	pod_builder = SPA_POD_BUILDER_INIT(params_buffer, sizeof(params_buffer));
@@ -1243,7 +1391,15 @@ obs_pipewire_stream *obs_pipewire_connect_stream(obs_pipewire *obs_pw, obs_sourc
 	pw_stream_connect(obs_pw_stream->stream, PW_DIRECTION_INPUT, pipewire_node,
 			  PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params, n_params);
 
-	blog(LOG_INFO, "[pipewire] Playing stream %p", obs_pw_stream->stream);
+	pw_blog(LOG_INFO, "[pipewire] Playing stream %p", obs_pw_stream->stream);
+
+	obs_pw_stream->health_timer =
+		pw_loop_add_timer(pw_thread_loop_get_loop(obs_pw->thread_loop), pw_capture_health, obs_pw_stream);
+	if (obs_pw_stream->health_timer) {
+		struct timespec interval = {.tv_sec = 60, .tv_nsec = 0};
+		pw_loop_update_timer(pw_thread_loop_get_loop(obs_pw->thread_loop), obs_pw_stream->health_timer,
+				     &interval, &interval, false);
+	}
 
 	pw_thread_loop_unlock(obs_pw->thread_loop);
 	bfree(params);
@@ -1251,6 +1407,20 @@ obs_pipewire_stream *obs_pipewire_connect_stream(obs_pipewire *obs_pw, obs_sourc
 	g_ptr_array_add(obs_pw->streams, obs_pw_stream);
 
 	return obs_pw_stream;
+}
+
+bool obs_pipewire_stream_accepts_frames(obs_pipewire_stream *obs_pw_stream)
+{
+	const char *error = NULL;
+	enum pw_stream_state state;
+
+	if (!obs_pw_stream || !obs_pw_stream->stream || !obs_pw_stream->obs_pw)
+		return false;
+
+	pw_thread_loop_lock(obs_pw_stream->obs_pw->thread_loop);
+	state = pw_stream_get_state(obs_pw_stream->stream, &error);
+	pw_thread_loop_unlock(obs_pw_stream->obs_pw->thread_loop);
+	return state == PW_STREAM_STATE_STREAMING || state == PW_STREAM_STATE_CONNECTING;
 }
 
 void obs_pipewire_stream_show(obs_pipewire_stream *obs_pw_stream)
@@ -1416,6 +1586,11 @@ void obs_pipewire_stream_destroy(obs_pipewire_stream *obs_pw_stream)
 	obs_leave_graphics();
 
 	pw_thread_loop_lock(obs_pw_stream->obs_pw->thread_loop);
+	if (obs_pw_stream->health_timer) {
+		pw_loop_destroy_source(pw_thread_loop_get_loop(obs_pw_stream->obs_pw->thread_loop),
+				       obs_pw_stream->health_timer);
+		obs_pw_stream->health_timer = NULL;
+	}
 	if (obs_pw_stream->stream)
 		pw_stream_disconnect(obs_pw_stream->stream);
 	g_clear_pointer(&obs_pw_stream->stream, pw_stream_destroy);

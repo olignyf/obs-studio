@@ -30,6 +30,8 @@ typedef struct _obs_pipewire_stream obs_pipewire_stream;
 struct obs_pipewire_connect_stream_info {
 	const char *stream_name;
 	struct pw_properties *stream_properties;
+	void (*state_callback)(enum pw_stream_state state, void *data);
+	void *state_callback_data;
 	struct {
 		bool cursor_visible;
 	} screencast;
@@ -52,6 +54,7 @@ obs_pipewire_stream *obs_pipewire_connect_stream(obs_pipewire *obs_pw, obs_sourc
 
 void obs_pipewire_stream_show(obs_pipewire_stream *obs_pw_stream);
 void obs_pipewire_stream_hide(obs_pipewire_stream *obs_pw_stream);
+bool obs_pipewire_stream_accepts_frames(obs_pipewire_stream *obs_pw_stream);
 uint32_t obs_pipewire_stream_get_width(obs_pipewire_stream *obs_pw_stream);
 uint32_t obs_pipewire_stream_get_height(obs_pipewire_stream *obs_pw_stream);
 void obs_pipewire_stream_video_render(obs_pipewire_stream *obs_pw_stream, gs_effect_t *effect);
