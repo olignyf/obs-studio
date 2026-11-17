@@ -135,8 +135,10 @@ void OBSBasic::RenderMain(void *data, uint32_t, uint32_t)
 
 	OBSBasic *window = static_cast<OBSBasic *>(data);
 	obs_video_info ovi;
+	OBSCanvasAutoRelease editing = window->GetEditingCanvas();
 
-	obs_get_video_info(&ovi);
+	if (!editing || !obs_canvas_get_video_info(editing, &ovi))
+		obs_get_video_info(&ovi);
 
 	window->previewCX = int(window->previewScale * float(ovi.base_width));
 	window->previewCY = int(window->previewScale * float(ovi.base_height));
@@ -159,13 +161,17 @@ void OBSBasic::RenderMain(void *data, uint32_t, uint32_t)
 	gs_ortho(0.0f, float(ovi.base_width), 0.0f, float(ovi.base_height), -100.0f, 100.0f);
 	gs_set_viewport(window->previewX, window->previewY, window->previewCX, window->previewCY);
 
-	if (window->IsPreviewProgramMode()) {
+	if (window->IsPreviewProgramMode() || !window->IsEditingMainCanvas()) {
 		window->DrawBackdrop(float(ovi.base_width), float(ovi.base_height));
 
-		OBSScene scene = window->GetCurrentScene();
-		obs_source_t *source = obs_scene_get_source(scene);
-		if (source) {
-			obs_source_video_render(source);
+		if (!window->IsEditingMainCanvas() && editing) {
+			obs_render_canvas_texture_src_color_only(editing);
+		} else {
+			OBSScene scene = window->GetCurrentScene();
+			obs_source_t *source = obs_scene_get_source(scene);
+			if (source) {
+				obs_source_video_render(source);
+			}
 		}
 	} else {
 		obs_render_main_texture_src_color_only();

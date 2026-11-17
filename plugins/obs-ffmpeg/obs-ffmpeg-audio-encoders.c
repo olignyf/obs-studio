@@ -75,6 +75,12 @@ static const char *pcm_getname(void *unused)
 	return obs_module_text("FFmpegPCM16Bit");
 }
 
+static const char *pcm_bluray_getname(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return obs_module_text("FFmpegPCMBluray");
+}
+
 static const char *pcm24_getname(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -371,6 +377,11 @@ static void *pcm_create(obs_data_t *settings, obs_encoder_t *encoder)
 	return enc_create(settings, encoder, "pcm_s16le", NULL, AV_SAMPLE_FMT_NONE);
 }
 
+static void *pcm_bluray_create(obs_data_t *settings, obs_encoder_t *encoder)
+{
+	return enc_create(settings, encoder, "pcm_bluray", NULL, AV_SAMPLE_FMT_S16);
+}
+
 static void *pcm24_create(obs_data_t *settings, obs_encoder_t *encoder)
 {
 	return enc_create(settings, encoder, "pcm_s24le", NULL, AV_SAMPLE_FMT_NONE);
@@ -547,6 +558,21 @@ struct obs_encoder_info pcm_encoder_info = {
 	.codec = "pcm_s16le",
 	.get_name = pcm_getname,
 	.create = pcm_create,
+	.destroy = enc_destroy,
+	.encode = enc_encode,
+	.get_frame_size = enc_frame_size,
+	.get_defaults = enc_defaults,
+	.get_properties = enc_properties,
+	.get_extra_data = enc_extra_data,
+	.get_audio_info = enc_audio_info,
+};
+
+struct obs_encoder_info pcm_bluray_encoder_info = {
+	.id = "ffmpeg_pcm_bluray",
+	.type = OBS_ENCODER_AUDIO,
+	.codec = "pcm_bluray",
+	.get_name = pcm_bluray_getname,
+	.create = pcm_bluray_create,
 	.destroy = enc_destroy,
 	.encode = enc_encode,
 	.get_frame_size = enc_frame_size,

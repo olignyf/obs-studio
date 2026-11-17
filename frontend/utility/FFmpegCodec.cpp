@@ -86,6 +86,8 @@ static const unordered_map<string, unordered_set<string>> codec_compat = {
 		 "hevc",
 		 "aac",
 		 "opus",
+		 "pcm_bluray",
+		 "pcm_s16le",
 	 }},
 	{"hls",
 	 // Also using MPEG-TS in our case, but no Opus support

@@ -106,9 +106,18 @@ void OBSBasic::AddScene(OBSSource source)
 {
 	const char *name = obs_source_get_name(source);
 	obs_scene_t *scene = obs_scene_from_source(source);
+	if (!scene)
+		return;
+
+	/* Canvas scenes emit source_create_canvas (not source_create); tolerate either path. */
+	for (int i = 0; i < ui->scenes->count(); i++) {
+		if (GetOBSRef<OBSScene>(ui->scenes->item(i)) == scene)
+			return;
+	}
 
 	QListWidgetItem *item = new QListWidgetItem(QT_UTF8(name));
 	SetOBSRef(item, OBSScene(scene));
+	item->setHidden(!SourceBelongsToEditingCanvas(source));
 	ui->scenes->insertItem(ui->scenes->currentRow() + 1, item);
 
 	obs_hotkey_register_source(
@@ -700,13 +709,22 @@ void OBSBasic::on_actionAddScene_triggered()
 		};
 
 		auto redo_fn = [this](const std::string &data) {
-			OBSSceneAutoRelease scene = obs_scene_create(data.c_str());
+			OBSCanvasAutoRelease editing = GetEditingCanvas();
+			OBSCanvasAutoRelease mainCanvas = obs_get_main_canvas();
+			OBSSceneAutoRelease scene =
+				(editing && mainCanvas && editing.Get() != mainCanvas.Get())
+					? obs_canvas_scene_create(editing, data.c_str())
+					: obs_scene_create(data.c_str());
 			obs_source_t *source = obs_scene_get_source(scene);
 			SetCurrentScene(source, true);
 		};
 		undo_s.add_action(QTStr("Undo.Add").arg(QString(name.c_str())), undo_fn, redo_fn, name, name);
 
-		OBSSceneAutoRelease scene = obs_scene_create(name.c_str());
+		OBSCanvasAutoRelease editing = GetEditingCanvas();
+		OBSCanvasAutoRelease mainCanvas = obs_get_main_canvas();
+		OBSSceneAutoRelease scene = (editing && mainCanvas && editing.Get() != mainCanvas.Get())
+						    ? obs_canvas_scene_create(editing, name.c_str())
+						    : obs_scene_create(name.c_str());
 		obs_source_t *scene_source = obs_scene_get_source(scene);
 		SetCurrentScene(scene_source);
 	}

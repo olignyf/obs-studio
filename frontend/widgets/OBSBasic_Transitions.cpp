@@ -689,20 +689,7 @@ void OBSBasic::SetCurrentScene(obs_scene_t *scene, bool force)
 
 void OBSBasic::SetCurrentScene(OBSSource scene, bool force)
 {
-	if (!IsPreviewProgramMode()) {
-		TransitionToScene(scene, force);
-	} else {
-		OBSSource actualLastScene = OBSGetStrongRef(lastScene);
-		if (actualLastScene != scene) {
-			if (scene) {
-				obs_source_inc_showing(scene);
-			}
-			if (actualLastScene) {
-				obs_source_dec_showing(actualLastScene);
-			}
-			lastScene = OBSGetWeakRef(scene);
-		}
-	}
+	ApplyEditingCanvasScene(scene, force);
 
 	if (obs_scene_get_source(GetCurrentScene()) != scene) {
 		for (int i = 0; i < ui->scenes->count(); i++) {

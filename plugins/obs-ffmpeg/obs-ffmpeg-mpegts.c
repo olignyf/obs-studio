@@ -208,6 +208,10 @@ static bool create_audio_stream(struct ffmpeg_output *stream, struct ffmpeg_data
 	const char *name = data->config.audio_encoder;
 	int channels;
 
+	/* Advertise Blu-ray LPCM (PMT 0x80). Keep 188-byte TS via mpegts_m2ts_mode=0. */
+	if (name && (strcmp(name, "pcm_s16le") == 0 || strcmp(name, "pcm_bluray") == 0))
+		name = "pcm_bluray";
+
 	const AVCodecDescriptor *codec = avcodec_descriptor_get_by_name(name);
 	if (!codec) {
 		warn("Couldn't find codec '%s'", name);
@@ -219,7 +223,7 @@ static bool create_audio_stream(struct ffmpeg_output *stream, struct ffmpeg_data
 		return false;
 	}
 
-	if (!new_stream(data, &avstream, data->config.audio_encoder))
+	if (!new_stream(data, &avstream, name))
 		return false;
 
 	context = avcodec_alloc_context3(NULL);
@@ -247,6 +251,13 @@ static bool create_audio_stream(struct ffmpeg_output *stream, struct ffmpeg_data
 	data->audio_infos[idx].stream = avstream;
 	data->audio_infos[idx].ctx = context;
 	avcodec_parameters_from_context(data->audio_infos[idx].stream->codecpar, context);
+	/* Hard-pin Blu-ray LPCM so PMT uses stream_type 0x80 (never bare 0x06). */
+	if (context->codec_id == AV_CODEC_ID_PCM_BLURAY || data->config.audio_encoder_id == AV_CODEC_ID_PCM_BLURAY) {
+		context->codec_id = AV_CODEC_ID_PCM_BLURAY;
+		avstream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+		avstream->codecpar->codec_id = AV_CODEC_ID_PCM_BLURAY;
+		avstream->codecpar->codec_tag = 0x80;
+	}
 	return true;
 }
 
@@ -276,6 +287,8 @@ int ff_network_init(void)
 #endif
 	return 1;
 }
+
+static int mpegts_interrupt_cb(void *opaque);
 
 static inline int connect_mpegts_url(struct ffmpeg_output *stream, bool is_rist)
 {
@@ -341,6 +354,9 @@ static inline int connect_mpegts_url(struct ffmpeg_output *stream, bool is_rist)
 		}
 	}
 	stream->h = uc;
+	/* Must be set before open: listener mode can block waiting for callers. */
+	uc->interrupt_callback.callback = mpegts_interrupt_cb;
+	uc->interrupt_callback.opaque = stream;
 	if (is_rist)
 		err = librist_open(uc, uc->url);
 	else
@@ -373,6 +389,16 @@ fail:
 
 typedef int (*write_packet_cb)(void *, const uint8_t *, int);
 
+static int mpegts_interrupt_cb(void *opaque)
+{
+	struct ffmpeg_output *stream = opaque;
+	if (!stream)
+		return 1;
+	if (os_event_try(stream->stop_event) == 0)
+		return 1;
+	return os_atomic_load_bool(&stream->stopping);
+}
+
 static inline int allocate_custom_aviocontext(struct ffmpeg_output *stream, bool is_rist)
 {
 	/* allocate buffers */
@@ -390,6 +416,10 @@ static inline int allocate_custom_aviocontext(struct ffmpeg_output *stream, bool
 
 	if (!buffer)
 		return AVERROR(ENOMEM);
+
+	/* So libsrt epoll waits can abort on stop instead of hanging forever. */
+	h->interrupt_callback.callback = mpegts_interrupt_cb;
+	h->interrupt_callback.opaque = stream;
 
 	/* allocate custom avio_context */
 	if (is_rist)
@@ -957,6 +987,9 @@ static bool setup_audio_settings(struct ffmpeg_output *stream, struct ffmpeg_cfg
 		config->audio_encoder_id = AV_CODEC_ID_AAC;
 	else if (strcmp(config->audio_encoder, "opus") == 0)
 		config->audio_encoder_id = AV_CODEC_ID_OPUS;
+	else if (strcmp(config->audio_encoder, "pcm_bluray") == 0 ||
+		 strcmp(config->audio_encoder, "pcm_s16le") == 0)
+		config->audio_encoder_id = AV_CODEC_ID_PCM_BLURAY;
 
 	/* c) get audio bitrate from the audio encoder. */
 	for (int idx = 0; idx < num_tracks; idx++) {
@@ -967,6 +1000,7 @@ static bool setup_audio_settings(struct ffmpeg_output *stream, struct ffmpeg_cfg
 
 	/* d) set audio frame size  */
 	config->frame_size = (int)obs_encoder_get_frame_size(aencoders[0]);
+
 	return true;
 }
 
@@ -1126,6 +1160,11 @@ static void ffmpeg_mpegts_stop_internal(void *data, uint64_t ts, bool signal)
 	bool have_to_join = false;
 	pthread_t to_join;
 
+	/* Abort any in-flight libsrt wait (first-caller listen, write epoll, etc.)
+	 * before joining; otherwise destroy/ResetOutputs deadlocks forever. */
+	os_atomic_set_bool(&stream->stopping, true);
+	os_event_signal(stream->stop_event);
+
 	/* macOS fix: handover of pthread; for some reason, maybe related to srt sockets, if the pthread joining is
 	 * done within the mutex, there can be a stall. So we just copy it and join out of the mutex. */
 	pthread_mutex_lock(&stream->start_stop_mutex);
@@ -1194,9 +1233,20 @@ static bool ffmpeg_mpegts_start(void *data)
 
 static void ffmpeg_mpegts_deactivate(struct ffmpeg_output *stream)
 {
+	os_atomic_set_bool(&stream->stopping, true);
+	os_event_signal(stream->stop_event);
+	os_sem_post(stream->write_sem);
+
+	/* Close SRT/RIST before joining write_thread. With live callers the write
+	 * path can block in srt_epoll_wait forever; closing sockets wakes it. */
+	if ((stream->ff_data.config.is_srt || stream->ff_data.config.is_rist) && stream->has_connected) {
+		if (stream->ff_data.output)
+			stream->ff_data.output->pb = NULL;
+		close_mpegts_url(stream, stream->ff_data.config.is_rist);
+		stream->has_connected = false;
+	}
+
 	if (stream->write_thread_active) {
-		os_event_signal(stream->stop_event);
-		os_sem_post(stream->write_sem);
 		pthread_join(stream->write_thread, NULL);
 		stream->write_thread_active = false;
 	}
@@ -1291,6 +1341,23 @@ static bool write_header(struct ffmpeg_output *stream, struct ffmpeg_data *data)
 		dstr_free(&str);
 	}
 
+	/* Always 188-byte MPEG-TS (no BDAV TP_extra_header / 192-byte m2ts). */
+	av_dict_set(&dict, "mpegts_m2ts_mode", "0", 0);
+
+	/* Re-assert audio codec right before PMT is built. */
+	for (int i = 0; i < data->num_audio_streams; i++) {
+		AVCodecParameters *par = data->audio_infos[i].stream ? data->audio_infos[i].stream->codecpar : NULL;
+		if (!par)
+			continue;
+		if (data->config.audio_encoder_id == AV_CODEC_ID_PCM_BLURAY || par->codec_id == AV_CODEC_ID_PCM_BLURAY ||
+		    par->codec_id == AV_CODEC_ID_PCM_S16LE) {
+			par->codec_type = AVMEDIA_TYPE_AUDIO;
+			par->codec_id = AV_CODEC_ID_PCM_BLURAY;
+			par->codec_tag = 0x80;
+			info("PMT audio[%d]: force pcm_bluray codec_id=%d tag=0x80 (188-byte TS)", i, (int)par->codec_id);
+		}
+	}
+
 	/* Allocate the stream private data and write the stream header. */
 	ret = avformat_write_header(data->output, &dict);
 	if (ret < 0) {
@@ -1380,7 +1447,7 @@ struct obs_output_info ffmpeg_mpegts_muxer = {
 #else
 	.encoded_video_codecs = "h264",
 #endif
-	.encoded_audio_codecs = "aac;opus",
+	.encoded_audio_codecs = "aac;opus;pcm_bluray;pcm_s16le",
 	.get_name = ffmpeg_mpegts_getname,
 	.create = ffmpeg_mpegts_create,
 	.destroy = ffmpeg_mpegts_destroy,

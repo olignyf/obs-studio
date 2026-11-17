@@ -206,6 +206,22 @@ void OBSBasic::SourceCreated(void *data, calldata_t *params)
 	}
 }
 
+void OBSBasic::SourceCreatedOnCanvas(void *data, calldata_t *params)
+{
+	OBSSource source = (obs_source_t *)calldata_ptr(params, "source");
+	obs_canvas_t *canvas = (obs_canvas_t *)calldata_ptr(params, "canvas");
+
+	if (!source || obs_scene_from_source(source) == NULL)
+		return;
+
+	/* Main-canvas scenes already arrive via source_create. */
+	OBSCanvasAutoRelease mainCanvas = obs_get_main_canvas();
+	if (canvas && mainCanvas && canvas == mainCanvas.Get())
+		return;
+
+	QMetaObject::invokeMethod(static_cast<OBSBasic *>(data), &OBSBasic::AddScene, WaitConnection(), source);
+}
+
 void OBSBasic::SourceRemoved(void *data, calldata_t *params)
 {
 	OBSSource source = (obs_source_t *)calldata_ptr(params, "source");

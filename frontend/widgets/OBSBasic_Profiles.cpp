@@ -585,9 +585,10 @@ void OBSBasic::on_actionImportProfile_triggered()
 			return;
 		}
 
-		const std::array<std::pair<std::string, bool>, 4> profileFiles{{
+		const std::array<std::pair<std::string, bool>, 5> profileFiles{{
 			{"basic.ini", true},
 			{"service.json", false},
+			{"service2.json", false},
 			{"streamEncoder.json", false},
 			{"recordEncoder.json", false},
 		}};
@@ -628,7 +629,7 @@ void OBSBasic::on_actionExportProfile_triggered()
 
 	const QString destinationDirectory = SelectDirectory(this, QTStr("Basic.MainMenu.Profile.Export"), home);
 
-	const std::array<std::string, 4> profileFiles{"basic.ini", "service.json", "streamEncoder.json",
+	const std::array<std::string, 5> profileFiles{"basic.ini", "service.json", "service2.json", "streamEncoder.json",
 						      "recordEncoder.json"};
 
 	if (!destinationDirectory.isEmpty() && !destinationDirectory.isNull()) {

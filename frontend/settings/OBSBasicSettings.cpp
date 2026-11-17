@@ -5335,6 +5335,8 @@ static void DisableIncompatibleSimpleCodecs(QComboBox *cbox, const QString &form
 		 * so we have to simply set the codec to the internal name. */
 		if (encName == "opus" || encName == "aac") {
 			codec = encName;
+		} else if (encName == "pcm") {
+			codec = "pcm_bluray";
 		} else {
 			const char *encoder_id = get_simple_output_encoder(QT_TO_UTF8(encName));
 			codec = obs_get_encoder_codec(encoder_id);

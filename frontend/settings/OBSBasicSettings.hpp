@@ -22,6 +22,9 @@
 
 #include <utility/FFmpegShared.hpp>
 
+#include <QCheckBox>
+#include <QComboBox>
+#include <QLineEdit>
 #include <QPointer>
 
 #define VOLUME_METER_DECAY_FAST 23.53
@@ -60,6 +63,9 @@ private:
 
 	bool generalChanged = false;
 	bool stream1Changed = false;
+	QCheckBox *enableStream2 = nullptr;
+	QLineEdit *stream2Server = nullptr;
+	QComboBox *stream2Canvas = nullptr;
 	bool outputsChanged = false;
 	bool audioChanged = false;
 	bool videoChanged = false;

@@ -40,10 +40,12 @@
 #include <util/util.hpp>
 
 #include <QAccessible>
+#include <QComboBox>
 #include <QPointer>
 #include <QSystemTrayIcon>
 
 #include <deque>
+#include <map>
 
 extern volatile bool recording_paused;
 
@@ -1150,17 +1152,32 @@ public:
 	 */
 private:
 	std::vector<OBS::Canvas> canvases;
+	OBSWeakCanvas editingCanvas;
+	std::map<std::string, OBSWeakSource> currentScenePerCanvas;
+	QPointer<QComboBox> canvasSelector;
 
 	static void CanvasRemoved(void *data, calldata_t *params);
 	void ClearCanvases();
+	void InitCanvasSwitcher();
+	void UpdateCanvasSelector();
+	void RefreshScenesForEditingCanvas();
+	void SyncCanvasScenesToUI();
+	void ApplyEditingCanvasScene(OBSSource scene, bool force);
 
 public:
 	const std::vector<OBS::Canvas> &GetCanvases() const noexcept { return canvases; }
 
 	const OBS::Canvas &AddCanvas(const std::string &name, obs_video_info *ovi = nullptr, int flags = 0);
+	OBSCanvasAutoRelease GetEditingCanvas();
+	bool IsEditingMainCanvas();
+	bool SourceBelongsToEditingCanvas(obs_source_t *source);
+	obs_canvas_t *EnsureSecondScreenCanvas();
+	void SetEditingCanvas(obs_canvas_t *canvas);
+	obs_source_t *CreateSourceOnEditingCanvas(const char *id, const char *name, obs_data_t *settings);
 
 public slots:
 	bool RemoveCanvas(OBSCanvas canvas);
+	void CanvasSelectorChanged(int index);
 
 	/* -------------------------------------
 	 * MARK: - OBSBasic_SceneItems
@@ -1186,6 +1203,7 @@ private:
 
 	/* OBS Callbacks */
 	static void SourceCreated(void *data, calldata_t *params);
+	static void SourceCreatedOnCanvas(void *data, calldata_t *params);
 	static void SourceRemoved(void *data, calldata_t *params);
 	static void SourceRenamed(void *data, calldata_t *params);
 
@@ -1353,15 +1371,21 @@ private slots:
 	 */
 private:
 	OBSService service;
+	OBSService service2;
 
 	bool InitService();
 
 public:
 	obs_service_t *GetService();
 	void SetService(obs_service_t *service);
+	obs_service_t *GetService2();
+	void SetService2(obs_service_t *service);
+	bool Stream2Enabled();
 
 	void SaveService();
 	bool LoadService();
+	void SaveService2();
+	bool LoadService2();
 
 	/* -------------------------------------
 	 * MARK: - OBSBasic_StatusBar

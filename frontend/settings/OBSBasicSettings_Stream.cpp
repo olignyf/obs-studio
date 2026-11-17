@@ -11,6 +11,11 @@
 
 #include <qt-wrappers.hpp>
 
+#include <QCheckBox>
+#include <QComboBox>
+#include <QFormLayout>
+#include <QGroupBox>
+#include <QLineEdit>
 #include <QUuid>
 
 static const QUuid &CustomServerUUID()
@@ -90,6 +95,27 @@ void OBSBasicSettings::InitStreamPage()
 		&OBSBasicSettings::UpdateMultitrackVideo);
 	connect(ui->multitrackVideoConfigOverrideEnable, &QCheckBox::toggled, this,
 		&OBSBasicSettings::UpdateMultitrackVideo);
+
+	auto *stream2Group = new QGroupBox(QTStr("Basic.Settings.Stream.Stream2"), ui->streamPage);
+	auto *stream2Layout = new QFormLayout(stream2Group);
+	enableStream2 = new QCheckBox(QTStr("Basic.Settings.Stream.Stream2.Enable"), stream2Group);
+	stream2Server = new QLineEdit(stream2Group);
+	stream2Server->setPlaceholderText(QStringLiteral("srt://0.0.0.0:8001?mode=listener"));
+	stream2Canvas = new QComboBox(stream2Group);
+	stream2Layout->addRow(enableStream2);
+	stream2Layout->addRow(QTStr("Basic.Settings.Stream.Stream2.Server"), stream2Server);
+	stream2Layout->addRow(QTStr("Basic.Settings.Stream.Stream2.Canvas"), stream2Canvas);
+	ui->verticalLayout_5->insertWidget(ui->verticalLayout_5->count() - 1, stream2Group);
+
+	auto markStreamChanged = [this]() {
+		if (!loading)
+			stream1Changed = true;
+	};
+	connect(enableStream2, &QCheckBox::toggled, this, markStreamChanged);
+	connect(stream2Server, &QLineEdit::textChanged, this, markStreamChanged);
+	connect(stream2Canvas, QOverload<int>::of(&QComboBox::currentIndexChanged), this, markStreamChanged);
+	connect(enableStream2, &QCheckBox::toggled, stream2Server, &QWidget::setEnabled);
+	connect(enableStream2, &QCheckBox::toggled, stream2Canvas, &QWidget::setEnabled);
 }
 
 void OBSBasicSettings::LoadStream1Settings()
@@ -191,6 +217,35 @@ void OBSBasicSettings::LoadStream1Settings()
 		if (!uuid.empty()) {
 			int idx = ui->multitrackVideoAdditionalCanvas->findData(uuid.data());
 			ui->multitrackVideoAdditionalCanvas->setCurrentIndex(idx);
+		}
+	}
+
+	if (enableStream2) {
+		enableStream2->setChecked(config_get_bool(main->Config(), "Stream2", "Enable"));
+		stream2Server->setEnabled(enableStream2->isChecked());
+		stream2Canvas->setEnabled(enableStream2->isChecked());
+
+		OBSDataAutoRelease s2settings = obs_service_get_settings(main->GetService2());
+		const char *server2 = obs_data_get_string(s2settings, "server");
+		if (!server2 || !*server2)
+			server2 = "srt://0.0.0.0:8001?mode=listener";
+		stream2Server->setText(QString::fromUtf8(server2));
+
+		stream2Canvas->clear();
+		for (const auto &canvas : main->GetCanvases()) {
+			if (obs_canvas_get_flags(canvas) & EPHEMERAL)
+				continue;
+			stream2Canvas->addItem(QString::fromUtf8(obs_canvas_get_name(canvas)),
+					       QString::fromUtf8(obs_canvas_get_uuid(canvas)));
+		}
+		if (stream2Canvas->count() == 0) {
+			stream2Canvas->addItem(QStringLiteral("Second Screen"), QString());
+		}
+		const char *canvasUuid = config_get_string(main->Config(), "Stream2", "CanvasUuid");
+		if (canvasUuid && *canvasUuid) {
+			int idx = stream2Canvas->findData(QString::fromUtf8(canvasUuid));
+			if (idx >= 0)
+				stream2Canvas->setCurrentIndex(idx);
 		}
 	}
 
@@ -372,8 +427,30 @@ void OBSBasicSettings::SaveStream1Settings()
 	SaveText(ui->multitrackVideoConfigOverride, "Stream1", "MultitrackVideoConfigOverride");
 	SaveComboData(ui->multitrackVideoAdditionalCanvas, "Stream1", "MultitrackExtraCanvas");
 
+	bool oldStream2 = config_get_bool(main->Config(), "Stream2", "Enable");
+	if (enableStream2) {
+		config_set_bool(main->Config(), "Stream2", "Enable", enableStream2->isChecked());
+		QString canvasUuid = stream2Canvas->currentData().toString();
+		if (enableStream2->isChecked()) {
+			obs_canvas_t *canvas = main->EnsureSecondScreenCanvas();
+			if (canvas && canvasUuid.isEmpty())
+				canvasUuid = QString::fromUtf8(obs_canvas_get_uuid(canvas));
+		}
+		config_set_string(main->Config(), "Stream2", "CanvasUuid", QT_TO_UTF8(canvasUuid));
+
+		OBSDataAutoRelease settings2 = obs_data_create();
+		obs_data_set_string(settings2, "server", QT_TO_UTF8(stream2Server->text().trimmed()));
+		OBSServiceAutoRelease newService2 =
+			obs_service_create("rtmp_custom", "second_service", settings2, nullptr);
+		if (newService2) {
+			main->SetService2(newService2);
+			main->SaveService2();
+		}
+	}
+
 	if (oldMultitrackVideoSetting != ui->enableMultitrackVideo->isChecked() ||
-	    oldWHIPSimulcastTotalLayers != ui->whipSimulcastTotalLayers->value()) {
+	    oldWHIPSimulcastTotalLayers != ui->whipSimulcastTotalLayers->value() ||
+	    oldStream2 != (enableStream2 && enableStream2->isChecked())) {
 		main->ResetOutputs();
 	}
 
@@ -1487,6 +1564,8 @@ bool OBSBasicSettings::ServiceAndACodecCompatible()
 
 	if (simple) {
 		codec = ui->simpleOutStrAEncoder->currentData().toString();
+		if (codec == "pcm")
+			codec = "pcm_bluray";
 	} else {
 		QString encoder = ui->advOutAEncoder->currentData().toString();
 		codec = obs_get_encoder_codec(QT_TO_UTF8(encoder));
@@ -1603,11 +1682,11 @@ bool OBSBasicSettings::ServiceSupportsCodecCheck()
 		fb_video_name = ui->simpleOutStrEncoder->itemText(fb_idx);
 
 		cur_enc = ui->simpleOutStrAEncoder->currentData().toString();
-		fb_enc = (cur_enc == "opus") ? "aac" : "opus";
+		fb_enc = (cur_enc == "aac") ? "opus" : "aac";
 
 		cur_audio_name = ui->simpleOutStrAEncoder->itemText(ui->simpleOutStrAEncoder->findData(cur_enc));
-		fb_audio_name = (cur_enc == "opus") ? QTStr("Basic.Settings.Output.Simple.Codec.AAC")
-						    : QTStr("Basic.Settings.Output.Simple.Codec.Opus");
+		fb_audio_name = (fb_enc == "opus") ? QTStr("Basic.Settings.Output.Simple.Codec.Opus")
+						   : QTStr("Basic.Settings.Output.Simple.Codec.AAC");
 	} else {
 		QString cur_enc = ui->advOutEncoder->currentData().toString();
 		QString fb_enc = get_adv_fallback(cur_enc);
@@ -1809,6 +1888,10 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 	if (service_supports_encoder(acodecs, "ffmpeg_opus")) {
 		ui->simpleOutStrAEncoder->addItem(QTStr("Basic.Settings.Output.Simple.Codec.Opus"), "opus");
 	}
+	if (service_supports_encoder(acodecs, "ffmpeg_pcm_bluray") ||
+	    service_supports_encoder(acodecs, "ffmpeg_pcm_s16le")) {
+		ui->simpleOutStrAEncoder->addItem(QTStr("Basic.Settings.Output.Simple.Codec.PCM"), "pcm");
+	}
 #undef ENCODER_STR
 
 	/* ------------------------------------------------- */
@@ -1856,7 +1939,7 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 	if (!lastAudioEnc.isEmpty()) {
 		int idx = ui->simpleOutStrAEncoder->findData(lastAudioEnc);
 		if (idx == -1) {
-			lastAudioEnc = (lastAudioEnc == "opus") ? "aac" : "opus";
+			lastAudioEnc = (lastAudioEnc == "aac") ? "opus" : "aac";
 			ui->simpleOutStrAEncoder->setProperty("changed", QVariant(true));
 			OutputsChanged();
 		}

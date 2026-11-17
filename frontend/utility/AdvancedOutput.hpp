@@ -4,11 +4,18 @@
 
 struct AdvancedOutput : BasicOutputHandler {
 	OBSEncoder streamAudioEnc;
+	OBSEncoder streamAudioEnc2;
 	OBSEncoder streamArchiveEnc;
 	OBSEncoder streamTrack[MAX_AUDIO_MIXES];
 	OBSEncoder recordTrack[MAX_AUDIO_MIXES];
 	OBSEncoder videoStreaming;
+	OBSEncoder videoStreaming2;
 	OBSEncoder videoRecording;
+	OBSOutputAutoRelease streamOutput2;
+	std::string outputType2;
+	OBSSignal startStreaming2;
+	OBSSignal stopStreaming2;
+	bool streamingActive2 = false;
 
 	bool ffmpegOutput;
 	bool ffmpegRecording;
@@ -30,6 +37,7 @@ struct AdvancedOutput : BasicOutputHandler {
 	inline void SetupRecording();
 	inline void SetupFFmpeg();
 	void SetupOutputs() override;
+	bool SetupStream2Output(obs_service_t *service2);
 	int GetAudioBitrate(size_t i, const char *id) const;
 
 	virtual std::shared_future<void> SetupStreaming(obs_service_t *service,

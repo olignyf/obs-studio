@@ -138,6 +138,7 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 
 	ui->setupUi(this);
 	ui->previewDisabledWidget->setVisible(false);
+	InitCanvasSwitcher();
 
 	/* Set up streaming connections */
 	connect(
@@ -815,6 +816,8 @@ void OBSBasic::InitOBSCallbacks()
 
 	signalHandlers.reserve(signalHandlers.size() + 6);
 	signalHandlers.emplace_back(obs_get_signal_handler(), "source_create", OBSBasic::SourceCreated, this);
+	signalHandlers.emplace_back(obs_get_signal_handler(), "source_create_canvas", OBSBasic::SourceCreatedOnCanvas,
+				    this);
 	signalHandlers.emplace_back(obs_get_signal_handler(), "source_remove", OBSBasic::SourceRemoved, this);
 	signalHandlers.emplace_back(obs_get_signal_handler(), "source_rename", OBSBasic::SourceRenamed, this);
 	signalHandlers.emplace_back(
@@ -1016,6 +1019,17 @@ void OBSBasic::OBSInit()
 	}
 
 	loaded = true;
+
+	{
+		OBSCanvasAutoRelease mainCanvas = obs_get_main_canvas();
+		if (mainCanvas)
+			editingCanvas = OBSGetWeakRef(mainCanvas.Get());
+	}
+	if (Stream2Enabled())
+		EnsureSecondScreenCanvas();
+	SyncCanvasScenesToUI();
+	UpdateCanvasSelector();
+	RefreshScenesForEditingCanvas();
 
 	previewEnabled = config_get_bool(App()->GetUserConfig(), "BasicWindow", "PreviewEnabled");
 

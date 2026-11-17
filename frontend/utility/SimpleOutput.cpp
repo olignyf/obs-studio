@@ -46,6 +46,26 @@ static bool CreateSimpleOpusEncoder(OBSEncoder &res, int bitrate, const char *na
 
 extern bool EncoderAvailable(const char *encoder);
 
+static bool CreateSimplePCMEncoder(OBSEncoder &res, const char *name, size_t idx)
+{
+	const char *id = EncoderAvailable("ffmpeg_pcm_bluray") ? "ffmpeg_pcm_bluray"
+							       : (EncoderAvailable("ffmpeg_pcm_s16le") ? "ffmpeg_pcm_s16le"
+												      : nullptr);
+	if (!id) {
+		res = nullptr;
+		return false;
+	}
+
+	res = obs_audio_encoder_create(id, name, nullptr, idx, nullptr);
+
+	if (res) {
+		obs_encoder_release(res);
+		return true;
+	}
+
+	return false;
+}
+
 void SimpleOutput::LoadRecordingPreset_Lossless()
 {
 	fileOutput = obs_output_create("ffmpeg_output", "simple_ffmpeg_output", nullptr, nullptr);
@@ -198,6 +218,8 @@ SimpleOutput::SimpleOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 
 	if (strcmp(audio_encoder, "opus") == 0) {
 		success = CreateSimpleOpusEncoder(audioStreaming, GetAudioBitrate(), "simple_opus", 0);
+	} else if (strcmp(audio_encoder, "pcm") == 0) {
+		success = CreateSimplePCMEncoder(audioStreaming, "simple_pcm", 0);
 	} else {
 		success = CreateSimpleAACEncoder(audioStreaming, GetAudioBitrate(), "simple_aac", 0);
 	}
@@ -208,6 +230,8 @@ SimpleOutput::SimpleOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 
 	if (strcmp(audio_encoder, "opus") == 0) {
 		success = CreateSimpleOpusEncoder(audioArchive, GetAudioBitrate(), SIMPLE_ARCHIVE_NAME, 1);
+	} else if (strcmp(audio_encoder, "pcm") == 0) {
+		success = CreateSimplePCMEncoder(audioArchive, SIMPLE_ARCHIVE_NAME, 1);
 	} else {
 		success = CreateSimpleAACEncoder(audioArchive, GetAudioBitrate(), SIMPLE_ARCHIVE_NAME, 1);
 	}

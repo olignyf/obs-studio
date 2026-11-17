@@ -20,26 +20,37 @@
 #include "OBSBasic.hpp"
 
 constexpr std::string_view OBSServiceFileName = "service.json";
+constexpr std::string_view OBSService2FileName = "service2.json";
+constexpr const char *kDefaultStream2Server = "srt://0.0.0.0:8001?mode=listener";
 
-void OBSBasic::SaveService()
+static void SaveServiceToFile(obs_service_t *svc, const std::filesystem::path &jsonFilePath, const char *label)
 {
-	if (!service) {
+	if (!svc)
 		return;
-	}
-
-	const OBSProfile &currentProfile = GetCurrentProfile();
-
-	const std::filesystem::path jsonFilePath = currentProfile.path / std::filesystem::u8path(OBSServiceFileName);
 
 	OBSDataAutoRelease data = obs_data_create();
-	OBSDataAutoRelease settings = obs_service_get_settings(service);
+	OBSDataAutoRelease settings = obs_service_get_settings(svc);
 
-	obs_data_set_string(data, "type", obs_service_get_type(service));
+	obs_data_set_string(data, "type", obs_service_get_type(svc));
 	obs_data_set_obj(data, "settings", settings);
 
 	if (!obs_data_save_json_safe(data, jsonFilePath.u8string().c_str(), "tmp", "bak")) {
-		blog(LOG_WARNING, "Failed to save service");
+		blog(LOG_WARNING, "Failed to save %s", label);
 	}
+}
+
+void OBSBasic::SaveService()
+{
+	const OBSProfile &currentProfile = GetCurrentProfile();
+	const std::filesystem::path jsonFilePath = currentProfile.path / std::filesystem::u8path(OBSServiceFileName);
+	SaveServiceToFile(service, jsonFilePath, "service");
+}
+
+void OBSBasic::SaveService2()
+{
+	const OBSProfile &currentProfile = GetCurrentProfile();
+	const std::filesystem::path jsonFilePath = currentProfile.path / std::filesystem::u8path(OBSService2FileName);
+	SaveServiceToFile(service2, jsonFilePath, "service2");
 }
 
 bool OBSBasic::LoadService()
@@ -94,19 +105,51 @@ bool OBSBasic::LoadService()
 	return true;
 }
 
+bool OBSBasic::LoadService2()
+{
+	OBSDataAutoRelease data;
+
+	try {
+		const OBSProfile &currentProfile = GetCurrentProfile();
+		const std::filesystem::path jsonFilePath =
+			currentProfile.path / std::filesystem::u8path(OBSService2FileName);
+
+		data = obs_data_create_from_json_file_safe(jsonFilePath.u8string().c_str(), "bak");
+		if (!data)
+			return false;
+	} catch (const std::invalid_argument &error) {
+		blog(LOG_ERROR, "%s", error.what());
+		return false;
+	}
+
+	obs_data_set_default_string(data, "type", "rtmp_custom");
+	const char *type = obs_data_get_string(data, "type");
+	OBSDataAutoRelease settings = obs_data_get_obj(data, "settings");
+	OBSDataAutoRelease hotkey_data = obs_data_get_obj(data, "hotkeys");
+
+	service2 = obs_service_create(type, "second_service", settings, hotkey_data);
+	obs_service_release(service2);
+	return service2 != nullptr;
+}
+
 bool OBSBasic::InitService()
 {
 	ProfileScope("OBSBasic::InitService");
 
-	if (LoadService()) {
-		return true;
+	if (!LoadService()) {
+		service = obs_service_create("rtmp_common", "default_service", nullptr, nullptr);
+		if (!service)
+			return false;
+		obs_service_release(service);
 	}
 
-	service = obs_service_create("rtmp_common", "default_service", nullptr, nullptr);
-	if (!service) {
-		return false;
+	if (!LoadService2()) {
+		OBSDataAutoRelease settings = obs_data_create();
+		obs_data_set_string(settings, "server", kDefaultStream2Server);
+		service2 = obs_service_create("rtmp_custom", "second_service", settings, nullptr);
+		if (service2)
+			obs_service_release(service2);
 	}
-	obs_service_release(service);
 
 	return true;
 }
@@ -125,4 +168,26 @@ void OBSBasic::SetService(obs_service_t *newService)
 	if (newService) {
 		service = newService;
 	}
+}
+
+obs_service_t *OBSBasic::GetService2()
+{
+	if (!service2) {
+		OBSDataAutoRelease settings = obs_data_create();
+		obs_data_set_string(settings, "server", kDefaultStream2Server);
+		service2 = obs_service_create("rtmp_custom", "second_service", settings, nullptr);
+		obs_service_release(service2);
+	}
+	return service2;
+}
+
+void OBSBasic::SetService2(obs_service_t *newService)
+{
+	if (newService)
+		service2 = newService;
+}
+
+bool OBSBasic::Stream2Enabled()
+{
+	return config_get_bool(Config(), "Stream2", "Enable");
 }

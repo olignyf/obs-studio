@@ -205,6 +205,10 @@ std::optional<OBSSource> setupNewSource(QWidget *parent, const char *id, const c
 	OBSScene scene = main->GetCurrentScene();
 
 	if (!scene) {
+		if (parent) {
+			OBSMessageBox::warning(parent, QTStr("Basic.Main.AddSourceHelp.Title"),
+					       QTStr("Basic.Main.AddSourceHelp.Text"));
+		}
 		return std::nullopt;
 	}
 
@@ -214,9 +218,7 @@ std::optional<OBSSource> setupNewSource(QWidget *parent, const char *id, const c
 		return std::nullopt;
 	}
 
-	const char *v_id = obs_get_latest_input_type_id(id);
-
-	source = obs_source_create(v_id, name, NULL, nullptr);
+	source = main->CreateSourceOnEditingCanvas(id, name, nullptr);
 	if (!source) {
 		return std::nullopt;
 	}
@@ -399,12 +401,22 @@ void OBSBasicSourceSelect::updateExistingSources(int limit)
 	sourceButtons = new QButtonGroup(this);
 	sourceButtons->setExclusive(false);
 
+	OBSBasic *main = OBSBasic::Get();
+	OBSCanvasAutoRelease editingCanvas = main->GetEditingCanvas();
+
 	std::vector<obs_weak_source_t *> matchingSources{};
 	std::copy_if(weakSources.begin(), weakSources.end(), std::back_inserter(matchingSources),
-		     [this](obs_weak_source_t *weak) {
+		     [this, &editingCanvas](obs_weak_source_t *weak) {
 			     OBSSource source = OBSGetStrongRef(weak);
 
 			     if (!source || obs_source_removed(source)) {
+				     return false;
+			     }
+
+			     /* Keep Add Existing scoped to the canvas being edited so a main-canvas
+			      * Screen Capture is not reused on Second Screen (each needs its own portal session). */
+			     OBSCanvasAutoRelease sourceCanvas = obs_source_get_canvas(source);
+			     if (editingCanvas && sourceCanvas && sourceCanvas.Get() != editingCanvas.Get()) {
 				     return false;
 			     }
 

@@ -1609,6 +1609,10 @@ EXPORT void obs_source_media_ended(obs_source_t *source);
 /** Get canvas this source belongs to (reference incremented) */
 EXPORT obs_canvas_t *obs_source_get_canvas(const obs_source_t *source);
 
+/** Create a source owned by a specific canvas (reference incremented) */
+EXPORT obs_source_t *obs_source_create_canvas(obs_canvas_t *canvas, const char *id, const char *name,
+					      obs_data_t *settings, obs_data_t *hotkey_data);
+
 /* ------------------------------------------------------------------------- */
 /* Transition-specific functions */
 enum obs_transition_target {

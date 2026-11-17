@@ -708,13 +708,8 @@ restart:
 			goto fail1;
 		}
 
-		/* Block until the first caller so the output stays in "connecting" until someone is watching. */
-		ret = libsrt_network_wait_fd_timeout(h, s->listen_eid, 0, s->listen_timeout, &h->interrupt_callback);
-		if (ret < 0) {
-			s->last_error.obs_output_error_number = OBS_OUTPUT_ERROR;
-			goto fail1;
-		}
-
+		/* Do not block for the first caller. Accept happens in libsrt_write_listener so
+		 * Start Streaming can complete (and settings Apply cannot deadlock on join). */
 		s->eid = srt_epoll_create();
 		if (s->eid < 0) {
 			ret = libsrt_neterrno(h);
@@ -723,12 +718,10 @@ restart:
 		}
 
 		ret = libsrt_accept_pending(h);
-		if (ret < 0 || s->client_count < 1) {
-			if (ret >= 0)
-				ret = AVERROR(EIO);
-			s->last_error.obs_output_error_number = OBS_OUTPUT_CONNECT_FAILED;
+		if (ret < 0)
 			goto fail1;
-		}
+
+		s->fd = s->client_count > 0 ? s->clients[0] : s->listen_fd;
 	} else {
 		int write_eid = ret = libsrt_epoll_create(h, fd, 1);
 		if (ret < 0) {
@@ -763,7 +756,9 @@ restart:
 
 	int packet_size = 0;
 	int optlen = sizeof(packet_size);
-	SRTSOCKET opt_fd = (s->mode == SRT_MODE_LISTENER) ? s->clients[0] : fd;
+	SRTSOCKET opt_fd = fd;
+	if (s->mode == SRT_MODE_LISTENER)
+		opt_fd = s->client_count > 0 ? s->clients[0] : s->listen_fd;
 	ret = libsrt_getsockopt(h, opt_fd, SRTO_PAYLOADSIZE, "SRTO_PAYLOADSIZE", &packet_size, &optlen);
 	if (ret < 0)
 		goto fail1;
@@ -1007,13 +1002,14 @@ static int libsrt_open(URLContext *h, const char *uri)
 	s->time = (double)timesp.tv_sec + 0.000000001 * (double)timesp.tv_nsec;
 #endif
 
-	/* In caller mode, srt_connect won't fail even if there is no established connection in non-blocking mode, so
-	 * we explicitly check for the socket status before okaying OBS_OUTPUT_SUCCESS.
-	 */
+	/* Caller mode: srt_connect can succeed without a peer in non-blocking mode, so verify CONNECTED.
+	 * Listener mode: socket stays LISTENING until a caller arrives (accepted later in write). */
 	SRT_SOCKSTATUS state = srt_getsockstate(s->fd);
-	if (state != SRTS_CONNECTED) {
-		blog(LOG_ERROR, "[obs-ffmpeg mpegts muxer / libsrt]: SRT socket not connected after open (state=%d)",
-		     state);
+	bool ok = (state == SRTS_CONNECTED) ||
+		  (s->mode == SRT_MODE_LISTENER && (state == SRTS_LISTENING || state == SRTS_CONNECTED));
+	if (!ok) {
+		blog(LOG_ERROR, "[obs-ffmpeg mpegts muxer / libsrt]: SRT socket not ready after open (state=%d mode=%d)",
+		     state, (int)s->mode);
 		libsrt_close(h);
 		if (s->last_error.obs_output_error_number != OBS_OUTPUT_SUCCESS)
 			return s->last_error.obs_output_error_number;
@@ -1071,6 +1067,9 @@ static int libsrt_write(URLContext *h, const uint8_t *buf, int size)
 	SRTContext *s = (SRTContext *)h->priv_data;
 	int ret;
 	SRT_TRACEBSTATS perf;
+
+	if (check_interrupt(&h->interrupt_callback))
+		return AVERROR_EXIT;
 
 	if (s->mode == SRT_MODE_LISTENER) {
 		ret = libsrt_write_listener(h, buf, size);

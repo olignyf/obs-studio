@@ -46,6 +46,22 @@ static void ApplyEncoderDefaults(OBSData &settings, const obs_encoder_t *encoder
 
 #define ADV_ARCHIVE_NAME "adv_archive_audio"
 
+static void OBSStartStreaming2(void *data, calldata_t *)
+{
+	auto *output = static_cast<AdvancedOutput *>(data);
+	output->streamingActive2 = true;
+	blog(LOG_INFO, "Second stream started");
+}
+
+static void OBSStopStreaming2(void *data, calldata_t *params)
+{
+	auto *output = static_cast<AdvancedOutput *>(data);
+	output->streamingActive2 = false;
+	const char *last_error = calldata_string(params, "last_error");
+	blog(LOG_INFO, "Second stream stopped%s%s", last_error && *last_error ? ": " : "",
+	     last_error && *last_error ? last_error : "");
+}
+
 #ifdef __APPLE__
 static void translate_macvth264_encoder(const char *&encoder)
 {
@@ -69,6 +85,9 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	translate_macvth264_encoder(streamEncoder);
 	translate_macvth264_encoder(recordEncoder);
 #endif
+	/* MPEG-TS needs Blu-ray LPCM framing + PMT 0x80 (still 188-byte TS). */
+	if (streamAudioEncoder && strcmp(streamAudioEncoder, "ffmpeg_pcm_s16le") == 0)
+		streamAudioEncoder = "ffmpeg_pcm_bluray";
 
 	ffmpegOutput = astrcmpi(recType, "FFmpeg") == 0;
 	ffmpegRecording = ffmpegOutput && config_get_bool(main->Config(), "AdvOut", "FFOutputToFile");
@@ -182,6 +201,22 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	}
 	obs_encoder_release(streamAudioEnc);
 
+	videoStreaming2 =
+		obs_video_encoder_create(streamEncoder, "advanced_video_stream2", streamEncSettings, nullptr);
+	if (!videoStreaming2) {
+		throw "Failed to create second streaming video encoder "
+		      "(advanced output)";
+	}
+	obs_encoder_release(videoStreaming2);
+
+	streamAudioEnc2 = obs_audio_encoder_create(streamAudioEncoder, "adv_stream_audio2", nullptr, streamTrackIndex,
+						   nullptr);
+	if (!streamAudioEnc2) {
+		throw "Failed to create second streaming audio encoder "
+		      "(advanced output)";
+	}
+	obs_encoder_release(streamAudioEnc2);
+
 	id = "";
 	int vodTrack = config_get_int(main->Config(), "AdvOut", "VodTrackIndex") - 1;
 	streamArchiveEnc = obs_audio_encoder_create(streamAudioEncoder, ADV_ARCHIVE_NAME, nullptr, vodTrack, nullptr);
@@ -255,9 +290,11 @@ void AdvancedOutput::UpdateStreamSettings()
 		break;
 	default:
 		obs_encoder_set_preferred_video_format(videoStreaming, VIDEO_FORMAT_NV12);
+		obs_encoder_set_preferred_video_format(videoStreaming2, VIDEO_FORMAT_NV12);
 	}
 
 	obs_encoder_update(videoStreaming, settings);
+	obs_encoder_update(videoStreaming2, settings);
 	if (whipSimulcastEncoders != nullptr) {
 		whipSimulcastEncoders->Update(settings, obs_data_get_int(settings, "bitrate"));
 	}
@@ -542,6 +579,7 @@ inline void AdvancedOutput::UpdateAudioSettings()
 
 			if (track == streamTrackIndex) {
 				obs_encoder_update(streamAudioEnc, settings[i]);
+				obs_encoder_update(streamAudioEnc2, settings[i]);
 			}
 			if (track == vodTrackIndex) {
 				obs_encoder_update(streamArchiveEnc, settings[i]);
@@ -563,7 +601,25 @@ void AdvancedOutput::SetupOutputs()
 		obs_encoder_set_audio(recordTrack[i], obs_get_audio());
 	}
 	obs_encoder_set_audio(streamAudioEnc, obs_get_audio());
+	obs_encoder_set_audio(streamAudioEnc2, obs_get_audio());
 	obs_encoder_set_audio(streamArchiveEnc, obs_get_audio());
+
+	if (main->Stream2Enabled()) {
+		OBSCanvasAutoRelease canvas;
+		const char *uuid = config_get_string(main->Config(), "Stream2", "CanvasUuid");
+		if (uuid && *uuid)
+			canvas = obs_get_canvas_by_uuid(uuid);
+		if (!canvas) {
+			obs_canvas_t *ensured = main->EnsureSecondScreenCanvas();
+			if (ensured)
+				canvas = obs_canvas_get_ref(ensured);
+		}
+		if (canvas) {
+			video_t *video = obs_canvas_get_video(canvas);
+			if (video)
+				obs_encoder_set_video(videoStreaming2, video);
+		}
+	}
 
 	SetupStreaming();
 
@@ -708,6 +764,58 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 				    });
 }
 
+bool AdvancedOutput::SetupStream2Output(obs_service_t *service2)
+{
+	if (!service2 || !main->Stream2Enabled())
+		return false;
+
+	const char *type = GetStreamOutputType(service2);
+	if (!type)
+		return false;
+
+	if (outputType2 != type) {
+		startStreaming2.Disconnect();
+		stopStreaming2.Disconnect();
+
+		streamOutput2 = obs_output_create(type, "adv_stream2", nullptr, nullptr);
+		if (!streamOutput2) {
+			blog(LOG_WARNING, "Creation of second stream output type '%s' failed!", type);
+			return false;
+		}
+
+		startStreaming2.Connect(obs_output_get_signal_handler(streamOutput2), "start", OBSStartStreaming2, this);
+		stopStreaming2.Connect(obs_output_get_signal_handler(streamOutput2), "stop", OBSStopStreaming2, this);
+		outputType2 = type;
+	}
+
+	OBSCanvasAutoRelease canvas;
+	const char *uuid = config_get_string(main->Config(), "Stream2", "CanvasUuid");
+	if (uuid && *uuid)
+		canvas = obs_get_canvas_by_uuid(uuid);
+	if (!canvas) {
+		obs_canvas_t *ensured = main->EnsureSecondScreenCanvas();
+		if (ensured)
+			canvas = obs_canvas_get_ref(ensured);
+	}
+	if (!canvas) {
+		blog(LOG_WARNING, "Second stream has no canvas");
+		return false;
+	}
+
+	video_t *video = obs_canvas_get_video(canvas);
+	if (!video) {
+		blog(LOG_WARNING, "Second stream canvas has no video");
+		return false;
+	}
+
+	obs_encoder_set_video(videoStreaming2, video);
+	obs_encoder_set_audio(streamAudioEnc2, obs_get_audio());
+	obs_output_set_video_encoder(streamOutput2, videoStreaming2);
+	obs_output_set_audio_encoder(streamOutput2, streamAudioEnc2, 0);
+	obs_output_set_service(streamOutput2, service2);
+	return true;
+}
+
 bool AdvancedOutput::StartStreaming(obs_service_t *service)
 {
 	obs_output_set_service(streamOutput, service);
@@ -758,9 +866,26 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	if (is_rtmp) {
 		SetupVodTrack(service);
 	}
+
+	const bool startStream2 = main->Stream2Enabled() && SetupStream2Output(main->GetService2());
+	if (startStream2) {
+		obs_output_update(streamOutput2, settings);
+		obs_output_set_delay(streamOutput2, useDelay ? delaySec : 0,
+				     preserveDelay ? OBS_OUTPUT_DELAY_PRESERVE : 0);
+		obs_output_set_reconnect_settings(streamOutput2, maxRetries, retryDelay);
+	}
+
 	if (obs_output_start(streamOutput)) {
 		if (multitrackVideo && multitrackVideoActive) {
 			multitrackVideo->StartedStreaming();
+		}
+		if (startStream2 && !obs_output_start(streamOutput2)) {
+			const char *error = obs_output_get_last_error(streamOutput2);
+			blog(LOG_WARNING, "Second stream failed to start%s%s", error && *error ? ": " : "",
+			     error && *error ? error : "");
+			main->ShowStatusBarMessage(
+				error && *error ? QTStr("Output.Stream2StartFailed").arg(error)
+						: QTStr("Output.Stream2StartFailedGeneric"));
 		}
 		return true;
 	}
@@ -931,6 +1056,13 @@ bool AdvancedOutput::StartReplayBuffer()
 
 void AdvancedOutput::StopStreaming(bool force)
 {
+	if (streamOutput2) {
+		if (force)
+			obs_output_force_stop(streamOutput2);
+		else
+			obs_output_stop(streamOutput2);
+	}
+
 	auto output = StreamingOutput();
 	if (force && output) {
 		obs_output_force_stop(output);

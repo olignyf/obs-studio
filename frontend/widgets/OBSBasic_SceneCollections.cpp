@@ -1265,6 +1265,14 @@ void OBSBasic::LoadData(obs_data_t *data, SceneCollection &collection)
 
 	if (collection_canvases) {
 		canvases = OBS::Canvas::LoadCanvases(collection_canvases);
+		/* Loaded canvases have no video mix until reset (obs_load_canvas passes NULL ovi). */
+		obs_video_info ovi;
+		if (obs_get_video_info(&ovi)) {
+			for (const auto &canvas : canvases) {
+				if (!obs_canvas_has_video(canvas) || !obs_canvas_get_video(canvas))
+					obs_canvas_reset_video(canvas, &ovi);
+			}
+		}
 	}
 
 	if (!sources) {
