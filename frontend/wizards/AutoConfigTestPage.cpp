@@ -238,6 +238,8 @@ void AutoConfigTestPage::TestBandwidthThread()
 			output_type = "ffmpeg_hls_muxer";
 		} else if (can_use_output(protocol, "ffmpeg_mpegts_muxer", "SRT", "RIST")) {
 			output_type = "ffmpeg_mpegts_muxer";
+		} else if (can_use_output(protocol, "ffmpeg_rtp_muxer", "RTP")) {
+			output_type = "ffmpeg_rtp_muxer";
 		}
 
 		/* If third-party protocol, use the first enumerated type */

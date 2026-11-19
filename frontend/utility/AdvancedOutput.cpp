@@ -85,9 +85,20 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	translate_macvth264_encoder(streamEncoder);
 	translate_macvth264_encoder(recordEncoder);
 #endif
-	/* MPEG-TS needs Blu-ray LPCM framing + PMT 0x80 (still 188-byte TS). */
-	if (streamAudioEncoder && strcmp(streamAudioEncoder, "ffmpeg_pcm_s16le") == 0)
-		streamAudioEncoder = "ffmpeg_pcm_bluray";
+	/* MPEG-TS/SRT: Blu-ray LPCM (PMT 0x80). RTP: keep raw PCM for L16. */
+	{
+		const char *proto = nullptr;
+		obs_service_t *svc = main->GetService();
+		if (svc)
+			proto = obs_service_get_protocol(svc);
+		const bool rtp = proto && strcmp(proto, "RTP") == 0;
+		if (rtp) {
+			if (streamAudioEncoder && strcmp(streamAudioEncoder, "ffmpeg_pcm_bluray") == 0)
+				streamAudioEncoder = "ffmpeg_pcm_s16le";
+		} else if (streamAudioEncoder && strcmp(streamAudioEncoder, "ffmpeg_pcm_s16le") == 0) {
+			streamAudioEncoder = "ffmpeg_pcm_bluray";
+		}
+	}
 
 	ffmpegOutput = astrcmpi(recType, "FFmpeg") == 0;
 	ffmpegRecording = ffmpegOutput && config_get_bool(main->Config(), "AdvOut", "FFOutputToFile");

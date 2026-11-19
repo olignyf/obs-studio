@@ -208,6 +208,8 @@ const char *GetStreamOutputType(const obs_service_t *service)
 		return "ffmpeg_hls_muxer";
 	} else if (can_use_output(protocol, "ffmpeg_mpegts_muxer", "SRT", "RIST")) {
 		return "ffmpeg_mpegts_muxer";
+	} else if (can_use_output(protocol, "ffmpeg_rtp_muxer", "RTP")) {
+		return "ffmpeg_rtp_muxer";
 	}
 
 	/* If third-party protocol, use the first enumerated type */

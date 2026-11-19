@@ -35,6 +35,7 @@ enum class ListOpt : int {
 	ShowAll = 1,
 	Custom,
 	WHIP,
+	RTP,
 };
 
 enum class Section : int {
@@ -50,6 +51,11 @@ bool OBSBasicSettings::IsCustomService() const
 inline bool OBSBasicSettings::IsWHIP() const
 {
 	return ui->service->currentData().toInt() == (int)ListOpt::WHIP;
+}
+
+inline bool OBSBasicSettings::IsRTP() const
+{
+	return ui->service->currentData().toInt() == (int)ListOpt::RTP;
 }
 
 void OBSBasicSettings::InitStreamPage()
@@ -145,8 +151,15 @@ void OBSBasicSettings::LoadStream1Settings()
 	}
 
 	if (is_rtmp_custom) {
-		ui->service->setCurrentIndex(0);
-		lastServiceIdx = 0;
+		const bool is_rtp = server && astrcmpi_n(server, "rtp://", 6) == 0;
+		int idx = 0;
+		if (is_rtp) {
+			idx = ui->service->findData((int)ListOpt::RTP);
+			if (idx < 0)
+				idx = 0;
+		}
+		ui->service->setCurrentIndex(idx);
+		lastServiceIdx = idx;
 		lastCustomServer = ui->customServer->text();
 
 		bool use_auth = obs_data_get_bool(settings, "use_auth");
@@ -323,9 +336,10 @@ void OBSBasicSettings::SaveStream1Settings()
 {
 	bool customServer = IsCustomService();
 	bool whip = IsWHIP();
+	bool rtp = IsRTP();
 	const char *service_id = "rtmp_common";
 
-	if (customServer) {
+	if (customServer || rtp) {
 		service_id = "rtmp_custom";
 	} else if (whip) {
 		service_id = "whip_custom";
@@ -336,7 +350,7 @@ void OBSBasicSettings::SaveStream1Settings()
 
 	OBSDataAutoRelease settings = obs_data_create();
 
-	if (!customServer && !whip) {
+	if (!customServer && !whip && !rtp) {
 		obs_data_set_string(settings, "service", QT_TO_UTF8(ui->service->currentText()));
 		obs_data_set_string(settings, "protocol", QT_TO_UTF8(protocol));
 		if (ui->server->currentData() == CustomServerUUID()) {
@@ -347,9 +361,12 @@ void OBSBasicSettings::SaveStream1Settings()
 			obs_data_set_string(settings, "server", QT_TO_UTF8(ui->server->currentData().toString()));
 		}
 	} else {
-		obs_data_set_string(settings, "server", QT_TO_UTF8(ui->customServer->text().trimmed()));
-		obs_data_set_bool(settings, "use_auth", ui->useAuth->isChecked());
-		if (ui->useAuth->isChecked()) {
+		QString server = ui->customServer->text().trimmed();
+		if (rtp && !server.isEmpty() && !server.startsWith("rtp://", Qt::CaseInsensitive))
+			server.prepend("rtp://");
+		obs_data_set_string(settings, "server", QT_TO_UTF8(server));
+		obs_data_set_bool(settings, "use_auth", !rtp && ui->useAuth->isChecked());
+		if (!rtp && ui->useAuth->isChecked()) {
 			obs_data_set_string(settings, "username", QT_TO_UTF8(ui->authUsername->text()));
 			obs_data_set_string(settings, "password", QT_TO_UTF8(ui->authPw->text()));
 		}
@@ -401,7 +418,7 @@ void OBSBasicSettings::SaveStream1Settings()
 
 	auto oldMultitrackVideoSetting = config_get_bool(main->Config(), "Stream1", "EnableMultitrackVideo");
 
-	if (!IsCustomService()) {
+	if (!IsCustomService() && !IsRTP()) {
 		OBSDataAutoRelease settings = obs_data_create();
 		obs_data_set_string(settings, "service", QT_TO_UTF8(ui->service->currentText()));
 		OBSServiceAutoRelease temp_service =
@@ -459,7 +476,7 @@ void OBSBasicSettings::SaveStream1Settings()
 
 void OBSBasicSettings::UpdateMoreInfoLink()
 {
-	if (IsCustomService() || IsWHIP()) {
+	if (IsCustomService() || IsWHIP() || IsRTP()) {
 		ui->moreInfoButton->hide();
 		return;
 	}
@@ -572,6 +589,10 @@ void OBSBasicSettings::LoadServices(bool showAll)
 		ui->service->addItem(QTStr("WHIP"), QVariant((int)ListOpt::WHIP));
 	}
 
+	if (obs_is_output_protocol_registered("RTP")) {
+		ui->service->addItem(QTStr("Basic.Settings.Stream.Service.RTP"), QVariant((int)ListOpt::RTP));
+	}
+
 	if (!showAll) {
 		ui->service->addItem(QTStr("Basic.AutoConfig.StreamPage.Service.ShowAll"),
 				     QVariant((int)ListOpt::ShowAll));
@@ -674,12 +695,12 @@ void OBSBasicSettings::on_service_currentIndexChanged(int idx)
 
 	if (ServiceSupportsCodecCheck() && UpdateResFPSLimits()) {
 		lastServiceIdx = idx;
-		if (idx == 0) {
+		if (idx == 0 || IsRTP()) {
 			lastCustomServer = ui->customServer->text();
 		}
 	}
 
-	if (!IsCustomService()) {
+	if (!IsCustomService() && !IsRTP()) {
 		ui->advStreamTrackWidget->setCurrentWidget(ui->streamSingleTracks);
 	} else {
 		SwapMultiTrack(QT_TO_UTF8(protocol));
@@ -712,6 +733,7 @@ void OBSBasicSettings::ServiceChanged(bool resetFields)
 	std::string service = ui->service->currentText().toStdString();
 	bool custom = IsCustomService();
 	bool whip = IsWHIP();
+	bool rtp = IsRTP();
 
 	ui->disconnectAccount->setVisible(false);
 	ui->bandwidthTestEnable->setVisible(false);
@@ -732,15 +754,28 @@ void OBSBasicSettings::ServiceChanged(bool resetFields)
 	ui->authPwLabel->setVisible(custom);
 	ui->authPwWidget->setVisible(custom);
 
-	if (custom || whip) {
+	if (custom || whip || rtp) {
 		ui->destinationLayout->insertRow(1, ui->serverLabel, ui->serverStackedWidget);
 
 		ui->serverStackedWidget->setCurrentIndex(1);
 		ui->serverStackedWidget->setVisible(true);
 		ui->serverLabel->setVisible(true);
+		if (rtp) {
+			ui->serverLabel->setText(QTStr("Basic.AutoConfig.StreamPage.Server"));
+			ui->streamKeyWidget->setVisible(false);
+			ui->streamKeyLabel->setVisible(false);
+			QString s = ui->customServer->text().trimmed();
+			if (s.isEmpty() || !s.startsWith("rtp://", Qt::CaseInsensitive))
+				ui->customServer->setText("rtp://127.0.0.1:5004");
+		} else {
+			ui->streamKeyWidget->setVisible(true);
+			ui->streamKeyLabel->setVisible(true);
+		}
 		on_useAuth_toggled();
 	} else {
 		ui->serverStackedWidget->setCurrentIndex(0);
+		ui->streamKeyWidget->setVisible(true);
+		ui->streamKeyLabel->setVisible(true);
 	}
 
 	auth.reset();
@@ -763,6 +798,10 @@ void OBSBasicSettings::ServiceChanged(bool resetFields)
 
 QString OBSBasicSettings::FindProtocol()
 {
+	if (IsRTP()) {
+		return QString("RTP");
+	}
+
 	if (IsCustomService()) {
 		if (ui->customServer->text().isEmpty()) {
 			return QString("RTMP");
@@ -780,6 +819,10 @@ QString OBSBasicSettings::FindProtocol()
 
 		if (server.startsWith("rist://")) {
 			return QString("RIST");
+		}
+
+		if (server.startsWith("rtp://")) {
+			return QString("RTP");
 		}
 
 	} else {
@@ -856,9 +899,10 @@ OBSService OBSBasicSettings::SpawnTempService()
 {
 	bool custom = IsCustomService();
 	bool whip = IsWHIP();
+	bool rtp = IsRTP();
 	const char *service_id = "rtmp_common";
 
-	if (custom) {
+	if (custom || rtp) {
 		service_id = "rtmp_custom";
 	} else if (whip) {
 		service_id = "whip_custom";
@@ -866,11 +910,14 @@ OBSService OBSBasicSettings::SpawnTempService()
 
 	OBSDataAutoRelease settings = obs_data_create();
 
-	if (!custom && !whip) {
+	if (!custom && !whip && !rtp) {
 		obs_data_set_string(settings, "service", QT_TO_UTF8(ui->service->currentText()));
 		obs_data_set_string(settings, "server", QT_TO_UTF8(ui->server->currentData().toString()));
 	} else {
-		obs_data_set_string(settings, "server", QT_TO_UTF8(ui->customServer->text().trimmed()));
+		QString server = ui->customServer->text().trimmed();
+		if (rtp && !server.isEmpty() && !server.startsWith("rtp://", Qt::CaseInsensitive))
+			server.prepend("rtp://");
+		obs_data_set_string(settings, "server", QT_TO_UTF8(server));
 	}
 
 	if (whip) {
@@ -1125,7 +1172,7 @@ OBSService OBSBasicSettings::GetStream1Service()
 
 void OBSBasicSettings::UpdateServiceRecommendations()
 {
-	bool customServer = IsCustomService();
+	bool customServer = IsCustomService() || IsRTP();
 	ui->ignoreRecommended->setVisible(!customServer);
 	ui->enforceSettingsLabel->setVisible(!customServer);
 
@@ -1200,7 +1247,7 @@ void OBSBasicSettings::UpdateServiceRecommendations()
 
 void OBSBasicSettings::DisplayEnforceWarning(bool checked)
 {
-	if (IsCustomService()) {
+	if (IsCustomService() || IsRTP()) {
 		return;
 	}
 
@@ -1303,7 +1350,7 @@ bool OBSBasicSettings::UpdateResFPSLimits()
 	size_t res_count = 0;
 	int max_fps = 0;
 
-	if (!IsCustomService() && !ignoreRecommended) {
+	if (!IsCustomService() && !IsRTP() && !ignoreRecommended) {
 		OBSService service = GetStream1Service();
 		obs_service_get_supported_resolutions(service, &res_list, &res_count);
 		obs_service_get_max_fps(service, &max_fps);
@@ -1537,7 +1584,7 @@ bool OBSBasicSettings::ServiceAndVCodecCompatible()
 	OBSService service = SpawnTempService();
 	const char **codecs = obs_service_get_supported_video_codecs(service);
 
-	if (!codecs || IsCustomService()) {
+	if (!codecs || IsCustomService() || IsRTP()) {
 		const char *output;
 		char **output_codecs;
 
@@ -1574,7 +1621,7 @@ bool OBSBasicSettings::ServiceAndACodecCompatible()
 	OBSService service = SpawnTempService();
 	const char **codecs = obs_service_get_supported_audio_codecs(service);
 
-	if (!codecs || IsCustomService()) {
+	if (!codecs || IsCustomService() || IsRTP()) {
 		const char *output;
 		char **output_codecs;
 
@@ -1655,7 +1702,7 @@ bool OBSBasicSettings::ServiceSupportsCodecCheck()
 	bool acodec_compat = ServiceAndACodecCompatible();
 
 	if (vcodec_compat && acodec_compat) {
-		if (lastServiceIdx != ui->service->currentIndex() || IsCustomService()) {
+		if (lastServiceIdx != ui->service->currentIndex() || IsCustomService() || IsRTP()) {
 			ResetEncoders(true);
 		}
 		return true;
@@ -1743,7 +1790,7 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 	BPtr<char *> output_acodecs;
 	size_t idx = 0;
 
-	if (!vcodecs || IsCustomService()) {
+	if (!vcodecs || IsCustomService() || IsRTP()) {
 		const char *output;
 
 		obs_enum_output_types_with_protocol(QT_TO_UTF8(protocol), &output, return_first_id);
@@ -1751,7 +1798,7 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 		vcodecs = (const char **)output_vcodecs.Get();
 	}
 
-	if (!acodecs || IsCustomService()) {
+	if (!acodecs || IsCustomService() || IsRTP()) {
 		const char *output;
 
 		obs_enum_output_types_with_protocol(QT_TO_UTF8(protocol), &output, return_first_id);

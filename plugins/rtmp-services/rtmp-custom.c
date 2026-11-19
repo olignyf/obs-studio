@@ -108,6 +108,7 @@ static const char *rtmp_custom_password(void *data)
 #define RTMPS_PREFIX "rtmps://"
 #define SRT_PREFIX "srt://"
 #define RIST_PREFIX "rist://"
+#define RTP_PREFIX "rtp://"
 
 static const char *rtmp_custom_get_protocol(void *data)
 {
@@ -121,6 +122,9 @@ static const char *rtmp_custom_get_protocol(void *data)
 
 	if (strncmp(service->server, RIST_PREFIX, strlen(RIST_PREFIX)) == 0)
 		return "RIST";
+
+	if (strncmp(service->server, RTP_PREFIX, strlen(RTP_PREFIX)) == 0)
+		return "RTP";
 
 	return "RTMP";
 }
@@ -139,6 +143,9 @@ static void rtmp_custom_apply_settings(void *data, obs_data_t *video_settings, o
 		obs_data_set_bool(video_settings, "repeat_headers", true);
 	if (has_mpegts && audio_settings != NULL)
 		obs_data_set_bool(audio_settings, "set_to_ADTS", true);
+	/* RTP (RFC 7798) wants annex-B style headers repeated for HEVC. */
+	if (strcmp(protocol, "RTP") == 0 && video_settings != NULL)
+		obs_data_set_bool(video_settings, "repeat_headers", true);
 }
 
 static const char *rtmp_custom_get_connect_info(void *data, uint32_t type)
