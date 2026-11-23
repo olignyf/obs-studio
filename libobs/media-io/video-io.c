@@ -377,6 +377,9 @@ static inline void reset_frames(video_t *video)
 
 static const video_t *get_const_root(const video_t *video)
 {
+	if (video == NULL)
+		return NULL;
+	
 	while (video->parent)
 		video = video->parent;
 	return video;
@@ -384,6 +387,9 @@ static const video_t *get_const_root(const video_t *video)
 
 static video_t *get_root(video_t *video)
 {
+	if (video == NULL)
+		return NULL;
+
 	while (video->parent)
 		video = video->parent;
 	return video;

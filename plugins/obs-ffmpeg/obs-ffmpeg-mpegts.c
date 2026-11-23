@@ -602,7 +602,8 @@ static void close_mpegts_url(struct ffmpeg_output *stream, bool is_rist)
 
 void ffmpeg_mpegts_data_free(struct ffmpeg_output *stream, struct ffmpeg_data *data)
 {
-	if (data->initialized)
+	/* pb may already be closed in ffmpeg_mpegts_deactivate (SRT/RIST wake-up). */
+	if (data->initialized && data->output && data->output->pb)
 		av_write_trailer(data->output);
 
 	if (data->video)
@@ -1241,7 +1242,7 @@ static void ffmpeg_mpegts_deactivate(struct ffmpeg_output *stream)
 	 * path can block in srt_epoll_wait forever; closing sockets wakes it. */
 	if ((stream->ff_data.config.is_srt || stream->ff_data.config.is_rist) && stream->has_connected) {
 		if (stream->ff_data.output)
-			stream->ff_data.output->pb = NULL;
+			stream->ff_data.output->pb = NULL; // This cause a subsequent crash in av_write_trailer() in ffmpeg_mpegts_data_free()
 		close_mpegts_url(stream, stream->ff_data.config.is_rist);
 		stream->has_connected = false;
 	}
