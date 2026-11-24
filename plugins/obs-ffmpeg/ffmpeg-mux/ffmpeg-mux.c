@@ -76,15 +76,11 @@ static inline void resize_buf_free(struct resize_buf *rb)
 
 /* ------------------------------------------------------------------------- */
 
-struct main_params {
-	char *file;
-	/* printable_file is file with any stream key information removed */
-	struct dstr printable_file;
-	int has_video;
-	int tracks;
+#define MAX_VIDEO_TRACKS 10
+
+struct video_params {
 	char *vcodec;
 	int vbitrate;
-	int gop;
 	int width;
 	int height;
 	int fps_num;
@@ -95,9 +91,17 @@ struct main_params {
 	int color_range;
 	int chroma_sample_location;
 	int max_luminance;
+	int codec_tag;
+};
+
+struct main_params {
+	char *file;
+	/* printable_file is file with any stream key information removed */
+	struct dstr printable_file;
+	int has_video;
+	int tracks;
 	char *acodec;
 	char *muxer_settings;
-	int codec_tag;
 };
 
 struct audio_params {
@@ -115,6 +119,11 @@ struct header {
 };
 
 struct audio_info {
+	AVStream *stream;
+	AVCodecContext *ctx;
+};
+
+struct video_info {
 	AVStream *stream;
 	AVCodecContext *ctx;
 };
@@ -139,14 +148,15 @@ struct io_buffer {
 
 struct ffmpeg_mux {
 	AVFormatContext *output;
-	AVStream *video_stream;
-	AVCodecContext *video_ctx;
 	AVPacket *packet;
+	struct video_info *video_infos;
 	struct audio_info *audio_infos;
 	struct main_params params;
+	struct video_params *video;
 	struct audio_params *audio;
-	struct header video_header;
+	struct header *video_header;
 	struct header *audio_header;
+	int num_video_streams;
 	int num_audio_streams;
 	bool initialized;
 	struct io_buffer io;
@@ -175,7 +185,10 @@ static void header_free(struct header *header)
 static void free_avformat(struct ffmpeg_mux *ffm)
 {
 	if (ffm->output) {
-		avcodec_free_context(&ffm->video_ctx);
+		if (ffm->video_infos) {
+			for (int i = 0; i < ffm->num_video_streams; ++i)
+				avcodec_free_context(&ffm->video_infos[i].ctx);
+		}
 
 		if ((ffm->output->oformat->flags & AVFMT_NOFILE) == 0) {
 			if (!ffmpeg_mux_is_network(ffm)) {
@@ -190,6 +203,11 @@ static void free_avformat(struct ffmpeg_mux *ffm)
 		ffm->output = NULL;
 	}
 
+	if (ffm->video_infos) {
+		free(ffm->video_infos);
+		ffm->video_infos = NULL;
+	}
+
 	if (ffm->audio_infos) {
 		for (int i = 0; i < ffm->num_audio_streams; ++i)
 			avcodec_free_context(&ffm->audio_infos[i].ctx);
@@ -197,8 +215,8 @@ static void free_avformat(struct ffmpeg_mux *ffm)
 		free(ffm->audio_infos);
 	}
 
-	ffm->video_stream = NULL;
 	ffm->audio_infos = NULL;
+	ffm->num_video_streams = 0;
 	ffm->num_audio_streams = 0;
 }
 
@@ -230,7 +248,14 @@ static void ffmpeg_mux_free(struct ffmpeg_mux *ffm)
 
 	free_avformat(ffm);
 
-	header_free(&ffm->video_header);
+	if (ffm->video_header) {
+		for (int i = 0; i < ffm->params.has_video; i++) {
+			header_free(&ffm->video_header[i]);
+		}
+
+		free(ffm->video_header);
+		ffm->video_header = NULL;
+	}
 
 	if (ffm->audio_header) {
 		for (int i = 0; i < ffm->params.tracks; i++) {
@@ -238,6 +263,11 @@ static void ffmpeg_mux_free(struct ffmpeg_mux *ffm)
 		}
 
 		free(ffm->audio_header);
+	}
+
+	if (ffm->video) {
+		free(ffm->video);
+		ffm->video = NULL;
 	}
 
 	if (ffm->audio) {
@@ -296,6 +326,37 @@ static bool get_audio_params(struct audio_params *audio, int *argc, char ***argv
 	return true;
 }
 
+static bool get_video_params(struct video_params *video, int *argc, char ***argv)
+{
+	if (!get_opt_str(argc, argv, &video->vcodec, "video codec"))
+		return false;
+	if (!get_opt_int(argc, argv, &video->vbitrate, "video bitrate"))
+		return false;
+	if (!get_opt_int(argc, argv, &video->width, "video width"))
+		return false;
+	if (!get_opt_int(argc, argv, &video->height, "video height"))
+		return false;
+	if (!get_opt_int(argc, argv, &video->color_primaries, "video color primaries"))
+		return false;
+	if (!get_opt_int(argc, argv, &video->color_trc, "video color trc"))
+		return false;
+	if (!get_opt_int(argc, argv, &video->colorspace, "video colorspace"))
+		return false;
+	if (!get_opt_int(argc, argv, &video->color_range, "video color range"))
+		return false;
+	if (!get_opt_int(argc, argv, &video->chroma_sample_location, "video chroma sample location"))
+		return false;
+	if (!get_opt_int(argc, argv, &video->max_luminance, "video max luminance"))
+		return false;
+	if (!get_opt_int(argc, argv, &video->fps_num, "video fps num"))
+		return false;
+	if (!get_opt_int(argc, argv, &video->fps_den, "video fps den"))
+		return false;
+	if (!get_opt_int(argc, argv, &video->codec_tag, "video codec tag"))
+		video->codec_tag = 0;
+	return true;
+}
+
 static void ffmpeg_log_callback(void *param, int level, const char *format, va_list args)
 {
 #ifdef ENABLE_FFMPEG_MUX_DEBUG
@@ -333,8 +394,10 @@ static void ffmpeg_log_callback(void *param, int level, const char *format, va_l
 	UNUSED_PARAMETER(param);
 }
 
-static bool init_params(int *argc, char ***argv, struct main_params *params, struct audio_params **p_audio)
+static bool init_params(int *argc, char ***argv, struct main_params *params, struct video_params **p_video,
+			struct audio_params **p_audio)
 {
+	struct video_params *video = NULL;
 	struct audio_params *audio = NULL;
 
 	if (!get_opt_str(argc, argv, &params->file, "file name"))
@@ -344,7 +407,7 @@ static bool init_params(int *argc, char ***argv, struct main_params *params, str
 	if (!get_opt_int(argc, argv, &params->tracks, "audio track count"))
 		return false;
 
-	if (params->has_video > 1 || params->has_video < 0) {
+	if (params->has_video > MAX_VIDEO_TRACKS || params->has_video < 0) {
 		puts("Invalid number of video tracks\n");
 		return false;
 	}
@@ -358,48 +421,36 @@ static bool init_params(int *argc, char ***argv, struct main_params *params, str
 	}
 
 	if (params->has_video) {
-		if (!get_opt_str(argc, argv, &params->vcodec, "video codec"))
+		video = calloc(params->has_video, sizeof(*video));
+		if (!video)
 			return false;
-		if (!get_opt_int(argc, argv, &params->vbitrate, "video bitrate"))
-			return false;
-		if (!get_opt_int(argc, argv, &params->width, "video width"))
-			return false;
-		if (!get_opt_int(argc, argv, &params->height, "video height"))
-			return false;
-		if (!get_opt_int(argc, argv, &params->color_primaries, "video color primaries"))
-			return false;
-		if (!get_opt_int(argc, argv, &params->color_trc, "video color trc"))
-			return false;
-		if (!get_opt_int(argc, argv, &params->colorspace, "video colorspace"))
-			return false;
-		if (!get_opt_int(argc, argv, &params->color_range, "video color range"))
-			return false;
-		if (!get_opt_int(argc, argv, &params->chroma_sample_location, "video chroma sample location"))
-			return false;
-		if (!get_opt_int(argc, argv, &params->max_luminance, "video max luminance"))
-			return false;
-		if (!get_opt_int(argc, argv, &params->fps_num, "video fps num"))
-			return false;
-		if (!get_opt_int(argc, argv, &params->fps_den, "video fps den"))
-			return false;
-		if (!get_opt_int(argc, argv, &params->codec_tag, "video codec tag"))
-			params->codec_tag = 0;
+
+		for (int i = 0; i < params->has_video; i++) {
+			if (!get_video_params(&video[i], argc, argv)) {
+				free(video);
+				return false;
+			}
+		}
 	}
 
 	if (params->tracks) {
-		if (!get_opt_str(argc, argv, &params->acodec, "audio codec"))
+		if (!get_opt_str(argc, argv, &params->acodec, "audio codec")) {
+			free(video);
 			return false;
+		}
 
 		audio = calloc(params->tracks, sizeof(*audio));
 
 		for (int i = 0; i < params->tracks; i++) {
 			if (!get_audio_params(&audio[i], argc, argv)) {
+				free(video);
 				free(audio);
 				return false;
 			}
 		}
 	}
 
+	*p_video = video;
 	*p_audio = audio;
 
 	dstr_copy(&params->printable_file, params->file);
@@ -428,11 +479,13 @@ static bool new_stream(struct ffmpeg_mux *ffm, AVStream **stream, const char *na
 	return true;
 }
 
-static void create_video_stream(struct ffmpeg_mux *ffm)
+static void create_video_stream(struct ffmpeg_mux *ffm, int idx)
 {
 	AVCodecContext *context;
+	AVStream *stream;
 	void *extradata = NULL;
-	const char *name = ffm->params.vcodec;
+	const struct video_params *vp = &ffm->video[idx];
+	const char *name = vp->vcodec;
 
 	const AVCodecDescriptor *codec = avcodec_descriptor_get_by_name(name);
 	if (!codec) {
@@ -440,47 +493,46 @@ static void create_video_stream(struct ffmpeg_mux *ffm)
 		return;
 	}
 
-	if (!new_stream(ffm, &ffm->video_stream, name))
+	if (!new_stream(ffm, &stream, name))
 		return;
 
-	if (ffm->video_header.size) {
-		extradata = av_memdup(ffm->video_header.data, ffm->video_header.size);
+	if (ffm->video_header[idx].size) {
+		extradata = av_memdup(ffm->video_header[idx].data, ffm->video_header[idx].size);
 	}
 
 	context = avcodec_alloc_context3(NULL);
 	context->codec_type = codec->type;
 	context->codec_id = codec->id;
-	context->codec_tag = ffm->params.codec_tag;
-	context->bit_rate = (int64_t)ffm->params.vbitrate * 1000;
-	context->width = ffm->params.width;
-	context->height = ffm->params.height;
-	context->coded_width = ffm->params.width;
-	context->coded_height = ffm->params.height;
-	context->color_primaries = ffm->params.color_primaries;
-	context->color_trc = ffm->params.color_trc;
-	context->colorspace = ffm->params.colorspace;
-	context->color_range = ffm->params.color_range;
-	context->chroma_sample_location = ffm->params.chroma_sample_location;
+	context->codec_tag = vp->codec_tag;
+	context->bit_rate = (int64_t)vp->vbitrate * 1000;
+	context->width = vp->width;
+	context->height = vp->height;
+	context->coded_width = vp->width;
+	context->coded_height = vp->height;
+	context->color_primaries = vp->color_primaries;
+	context->color_trc = vp->color_trc;
+	context->colorspace = vp->colorspace;
+	context->color_range = vp->color_range;
+	context->chroma_sample_location = vp->chroma_sample_location;
 	context->extradata = extradata;
-	context->extradata_size = ffm->video_header.size;
-	context->time_base = (AVRational){ffm->params.fps_den, ffm->params.fps_num};
+	context->extradata_size = ffm->video_header[idx].size;
+	context->time_base = (AVRational){vp->fps_den, vp->fps_num};
 
-	ffm->video_stream->time_base = context->time_base;
-	ffm->video_stream->avg_frame_rate = av_inv_q(context->time_base);
+	stream->time_base = context->time_base;
+	stream->avg_frame_rate = av_inv_q(context->time_base);
 
 	if (ffm->output->oformat->flags & AVFMT_GLOBALHEADER)
 		context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
-	avcodec_parameters_from_context(ffm->video_stream->codecpar, context);
+	avcodec_parameters_from_context(stream->codecpar, context);
 
-	const int max_luminance = ffm->params.max_luminance;
+	const int max_luminance = vp->max_luminance;
 	if (max_luminance > 0) {
 		size_t content_size;
 		AVContentLightMetadata *const content = av_content_light_metadata_alloc(&content_size);
 		content->MaxCLL = max_luminance;
 		content->MaxFALL = max_luminance;
-		av_packet_side_data_add(&ffm->video_stream->codecpar->coded_side_data,
-					&ffm->video_stream->codecpar->nb_coded_side_data,
+		av_packet_side_data_add(&stream->codecpar->coded_side_data, &stream->codecpar->nb_coded_side_data,
 					AV_PKT_DATA_CONTENT_LIGHT_LEVEL, (uint8_t *)content, content_size, 0);
 
 		AVMasteringDisplayMetadata *const mastering = av_mastering_display_metadata_alloc();
@@ -496,13 +548,14 @@ static void create_video_stream(struct ffmpeg_mux *ffm)
 		mastering->max_luminance = av_make_q(max_luminance, 1);
 		mastering->has_primaries = 1;
 		mastering->has_luminance = 1;
-		av_packet_side_data_add(&ffm->video_stream->codecpar->coded_side_data,
-					&ffm->video_stream->codecpar->nb_coded_side_data,
+		av_packet_side_data_add(&stream->codecpar->coded_side_data, &stream->codecpar->nb_coded_side_data,
 					AV_PKT_DATA_MASTERING_DISPLAY_METADATA, (uint8_t *)mastering,
 					sizeof(*mastering), 0);
 	}
 
-	ffm->video_ctx = context;
+	ffm->video_infos[ffm->num_video_streams].stream = stream;
+	ffm->video_infos[ffm->num_video_streams].ctx = context;
+	ffm->num_video_streams++;
 }
 
 static void create_audio_stream(struct ffmpeg_mux *ffm, int idx)
@@ -569,8 +622,14 @@ static void create_audio_stream(struct ffmpeg_mux *ffm, int idx)
 
 static bool init_streams(struct ffmpeg_mux *ffm)
 {
-	if (ffm->params.has_video)
-		create_video_stream(ffm);
+	if (ffm->params.has_video) {
+		ffm->video_infos = calloc(ffm->params.has_video, sizeof(*ffm->video_infos));
+		if (!ffm->video_infos)
+			return false;
+
+		for (int i = 0; i < ffm->params.has_video; i++)
+			create_video_stream(ffm, i);
+	}
 
 	if (ffm->params.tracks) {
 		ffm->audio_infos = calloc(ffm->params.tracks, sizeof(*ffm->audio_infos));
@@ -579,7 +638,7 @@ static bool init_streams(struct ffmpeg_mux *ffm)
 			create_audio_stream(ffm, i);
 	}
 
-	if (!ffm->video_stream && !ffm->num_audio_streams)
+	if (!ffm->num_video_streams && !ffm->num_audio_streams)
 		return false;
 
 	return true;
@@ -595,7 +654,8 @@ static void set_header(struct header *header, uint8_t *data, size_t size)
 static void ffmpeg_mux_header(struct ffmpeg_mux *ffm, uint8_t *data, struct ffm_packet_info *info)
 {
 	if (info->type == FFM_PACKET_VIDEO) {
-		set_header(&ffm->video_header, data, (size_t)info->size);
+		if ((int)info->index < ffm->params.has_video)
+			set_header(&ffm->video_header[info->index], data, (size_t)info->size);
 	} else {
 		set_header(&ffm->audio_header[info->index], data, (size_t)info->size);
 	}
@@ -640,7 +700,7 @@ static bool ffmpeg_mux_get_header(struct ffmpeg_mux *ffm)
 
 static inline bool ffmpeg_mux_get_extra_data(struct ffmpeg_mux *ffm)
 {
-	if (ffm->params.has_video) {
+	for (int i = 0; i < ffm->params.has_video; i++) {
 		if (!ffmpeg_mux_get_header(ffm)) {
 			return false;
 		}
@@ -993,8 +1053,14 @@ static int ffmpeg_mux_init_internal(struct ffmpeg_mux *ffm, int argc, char *argv
 {
 	argc--;
 	argv++;
-	if (!init_params(&argc, &argv, &ffm->params, &ffm->audio))
+	if (!init_params(&argc, &argv, &ffm->params, &ffm->video, &ffm->audio))
 		return FFM_ERROR;
+
+	if (ffm->params.has_video) {
+		ffm->video_header = calloc(ffm->params.has_video, sizeof(*ffm->video_header));
+		if (!ffm->video_header)
+			return FFM_ERROR;
+	}
 
 	if (ffm->params.tracks) {
 		ffm->audio_header = calloc(ffm->params.tracks, sizeof(*ffm->audio_header));
@@ -1025,8 +1091,8 @@ static int ffmpeg_mux_init(struct ffmpeg_mux *ffm, int argc, char *argv[])
 static inline int get_index(struct ffmpeg_mux *ffm, struct ffm_packet_info *info)
 {
 	if (info->type == FFM_PACKET_VIDEO) {
-		if (ffm->video_stream) {
-			return ffm->video_stream->id;
+		if ((int)info->index < ffm->num_video_streams && ffm->video_infos[info->index].stream) {
+			return ffm->video_infos[info->index].stream->id;
 		}
 	} else {
 		if ((int)info->index < ffm->num_audio_streams) {
@@ -1040,8 +1106,8 @@ static inline int get_index(struct ffmpeg_mux *ffm, struct ffm_packet_info *info
 static AVCodecContext *get_codec_context(struct ffmpeg_mux *ffm, struct ffm_packet_info *info)
 {
 	if (info->type == FFM_PACKET_VIDEO) {
-		if (ffm->video_stream) {
-			return ffm->video_ctx;
+		if ((int)info->index < ffm->num_video_streams) {
+			return ffm->video_infos[info->index].ctx;
 		}
 	} else {
 		if ((int)info->index < ffm->num_audio_streams) {
@@ -1074,7 +1140,11 @@ static inline bool ffmpeg_mux_packet(struct ffmpeg_mux *ffm, uint8_t *buf, struc
 		return true;
 	}
 
-	const AVRational codec_time_base = get_codec_context(ffm, info)->time_base;
+	AVCodecContext *ctx = get_codec_context(ffm, info);
+	if (!ctx)
+		return true;
+
+	const AVRational codec_time_base = ctx->time_base;
 
 	ffm->packet->data = buf;
 	ffm->packet->size = (int)info->size;

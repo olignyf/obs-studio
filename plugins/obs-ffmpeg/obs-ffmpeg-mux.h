@@ -39,9 +39,9 @@ struct ffmpeg_muxer {
 	mux_packets_t mux_packets;
 
 	/* split file */
-	bool found_video;
+	bool found_video[MAX_OUTPUT_VIDEO_ENCODERS];
 	bool found_audio[MAX_AUDIO_MIXES];
-	int64_t video_pts_offset;
+	int64_t video_pts_offsets[MAX_OUTPUT_VIDEO_ENCODERS];
 	int64_t audio_dts_offsets[MAX_AUDIO_MIXES];
 	bool split_file_ready;
 	volatile bool manual_split;

@@ -430,6 +430,21 @@ inline void AdvancedOutput::SetupRecording()
 		}
 	}
 
+	/* Dual-video MKV: second canvas as video track 1 when Stream2 is enabled. */
+	const bool dual_mkv = main->Stream2Enabled() && strcmp(recFormat, "mkv") == 0 && videoStreaming2 &&
+			      astrcmpi(obs_output_get_id(fileOutput), "ffmpeg_muxer") == 0;
+	if (dual_mkv) {
+		obs_output_set_video_encoder2(fileOutput, videoStreaming2, 1);
+		if (replayBuffer)
+			obs_output_set_video_encoder2(replayBuffer, videoStreaming2, 1);
+		blog(LOG_INFO, "Dual-video MKV recording: attaching second canvas encoder '%s'",
+		     obs_encoder_get_name(videoStreaming2));
+	} else {
+		obs_output_set_video_encoder2(fileOutput, nullptr, 1);
+		if (replayBuffer)
+			obs_output_set_video_encoder2(replayBuffer, nullptr, 1);
+	}
+
 	if (!flv) {
 		for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
 			if ((tracks & (1 << i)) != 0) {
