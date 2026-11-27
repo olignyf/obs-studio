@@ -12,10 +12,15 @@ struct AdvancedOutput : BasicOutputHandler {
 	OBSEncoder videoStreaming2;
 	OBSEncoder videoRecording;
 	OBSOutputAutoRelease streamOutput2;
+	OBSOutputAutoRelease fileOutput2;
 	std::string outputType2;
 	OBSSignal startStreaming2;
 	OBSSignal stopStreaming2;
 	bool streamingActive2 = false;
+	bool dualRecordSeparate = false;
+
+	const char *Stream2RecordMode() const;
+	bool SetupSeparateRecording();
 
 	bool ffmpegOutput;
 	bool ffmpegRecording;

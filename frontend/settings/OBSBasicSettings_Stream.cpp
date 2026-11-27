@@ -122,6 +122,7 @@ void OBSBasicSettings::InitStreamPage()
 	connect(stream2Canvas, QOverload<int>::of(&QComboBox::currentIndexChanged), this, markStreamChanged);
 	connect(enableStream2, &QCheckBox::toggled, stream2Server, &QWidget::setEnabled);
 	connect(enableStream2, &QCheckBox::toggled, stream2Canvas, &QWidget::setEnabled);
+	connect(enableStream2, &QCheckBox::toggled, this, &OBSBasicSettings::UpdateDualCanvasRecordVisibility);
 }
 
 void OBSBasicSettings::LoadStream1Settings()
@@ -261,6 +262,7 @@ void OBSBasicSettings::LoadStream1Settings()
 				stream2Canvas->setCurrentIndex(idx);
 		}
 	}
+	UpdateDualCanvasRecordVisibility();
 
 	UpdateServerList();
 

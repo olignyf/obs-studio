@@ -861,6 +861,27 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 
 	InitStreamPage();
 	InitAppearancePage();
+
+	dualCanvasRecordLabel = new QLabel(QTStr("Basic.Settings.Output.Adv.Recording.DualCanvas"), this);
+	dualCanvasRecordMode = new QComboBox(this);
+	dualCanvasRecordMode->addItem(QTStr("Basic.Settings.Output.Adv.Recording.DualCanvas.None"),
+				      QStringLiteral("none"));
+	dualCanvasRecordMode->addItem(QTStr("Basic.Settings.Output.Adv.Recording.DualCanvas.Multitrack"),
+				      QStringLiteral("multitrack"));
+	dualCanvasRecordMode->addItem(QTStr("Basic.Settings.Output.Adv.Recording.DualCanvas.Separate"),
+				      QStringLiteral("separate"));
+	{
+		int trackRow = -1;
+		QFormLayout::ItemRole role;
+		ui->formLayout_16->getWidgetPosition(ui->advRecTrackWidget, &trackRow, &role);
+		if (trackRow >= 0)
+			ui->formLayout_16->insertRow(trackRow + 1, dualCanvasRecordLabel, dualCanvasRecordMode);
+		else
+			ui->formLayout_16->addRow(dualCanvasRecordLabel, dualCanvasRecordMode);
+	}
+	HookWidget(dualCanvasRecordMode, COMBO_CHANGED, OUTPUTS_CHANGED);
+	UpdateDualCanvasRecordVisibility();
+
 	LoadSettings(false);
 
 	ui->advOutTrack1->setAccessibleName(QTStr("Basic.Settings.Output.Adv.Audio.Track1"));
@@ -1996,6 +2017,22 @@ void OBSBasicSettings::LoadAdvOutputStreamingEncoderProperties()
 	UpdateStreamDelayEstimate();
 }
 
+void OBSBasicSettings::UpdateDualCanvasRecordVisibility()
+{
+	if (!dualCanvasRecordLabel || !dualCanvasRecordMode)
+		return;
+
+	const bool show = enableStream2 && enableStream2->isChecked();
+	dualCanvasRecordLabel->setVisible(show);
+	dualCanvasRecordMode->setVisible(show);
+
+	int row = -1;
+	QFormLayout::ItemRole role;
+	ui->formLayout_16->getWidgetPosition(dualCanvasRecordMode, &row, &role);
+	if (row >= 0)
+		ui->formLayout_16->setRowVisible(row, show);
+}
+
 void OBSBasicSettings::LoadAdvOutputRecordingSettings()
 {
 	const char *type = config_get_string(main->Config(), "AdvOut", "RecType");
@@ -2032,6 +2069,15 @@ void OBSBasicSettings::LoadAdvOutputRecordingSettings()
 	ui->advOutRecTrack4->setChecked(tracks & (1 << 3));
 	ui->advOutRecTrack5->setChecked(tracks & (1 << 4));
 	ui->advOutRecTrack6->setChecked(tracks & (1 << 5));
+
+	if (dualCanvasRecordMode) {
+		const char *recMode = config_get_string(main->Config(), "Stream2", "RecordMode");
+		if (!recMode || !*recMode)
+			recMode = "multitrack";
+		int modeIdx = dualCanvasRecordMode->findData(QString::fromUtf8(recMode));
+		dualCanvasRecordMode->setCurrentIndex(modeIdx >= 0 ? modeIdx : 1);
+	}
+	UpdateDualCanvasRecordVisibility();
 
 	if (astrcmpi(splitFileType, "Size") == 0) {
 		idx = 1;
@@ -3565,6 +3611,15 @@ void OBSBasicSettings::SaveOutputSettings()
 	SaveSpinBox(ui->advOutSplitFileSize, "AdvOut", "RecSplitFileSize");
 
 	config_set_int(main->Config(), "AdvOut", "RecTracks", AdvOutGetSelectedAudioTracks());
+
+	if (dualCanvasRecordMode) {
+		const char *oldRecMode = config_get_string(main->Config(), "Stream2", "RecordMode");
+		std::string oldRecModeStr = oldRecMode && *oldRecMode ? oldRecMode : "multitrack";
+		QString recMode = dualCanvasRecordMode->currentData().toString();
+		config_set_string(main->Config(), "Stream2", "RecordMode", QT_TO_UTF8(recMode));
+		if (oldRecModeStr != recMode.toStdString())
+			main->ResetOutputs();
+	}
 
 	config_set_int(main->Config(), "AdvOut", "FLVTrack", CurrentFLVTrack());
 

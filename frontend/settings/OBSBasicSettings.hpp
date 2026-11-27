@@ -66,6 +66,9 @@ private:
 	QCheckBox *enableStream2 = nullptr;
 	QLineEdit *stream2Server = nullptr;
 	QComboBox *stream2Canvas = nullptr;
+	QLabel *dualCanvasRecordLabel = nullptr;
+	QComboBox *dualCanvasRecordMode = nullptr;
+	void UpdateDualCanvasRecordVisibility();
 	bool outputsChanged = false;
 	bool audioChanged = false;
 	bool videoChanged = false;

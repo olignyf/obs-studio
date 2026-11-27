@@ -430,10 +430,13 @@ inline void AdvancedOutput::SetupRecording()
 		}
 	}
 
-	/* Dual-video MKV: second canvas as video track 1 when Stream2 is enabled. */
-	const bool dual_mkv = main->Stream2Enabled() && strcmp(recFormat, "mkv") == 0 && videoStreaming2 &&
+	const char *recMode = Stream2RecordMode();
+	const bool can_dual = main->Stream2Enabled() && strcmp(recFormat, "mkv") == 0 && videoStreaming2 &&
 			      astrcmpi(obs_output_get_id(fileOutput), "ffmpeg_muxer") == 0;
-	if (dual_mkv) {
+	const bool dual_multitrack = can_dual && strcmp(recMode, "multitrack") == 0;
+	dualRecordSeparate = can_dual && strcmp(recMode, "separate") == 0;
+
+	if (dual_multitrack) {
 		obs_output_set_video_encoder2(fileOutput, videoStreaming2, 1);
 		if (replayBuffer)
 			obs_output_set_video_encoder2(replayBuffer, videoStreaming2, 1);
@@ -484,6 +487,92 @@ inline void AdvancedOutput::SetupRecording()
 	if (replayBuffer) {
 		obs_output_update(replayBuffer, settings);
 	}
+
+	if (dualRecordSeparate) {
+		if (SetupSeparateRecording()) {
+			OBSDataAutoRelease s2 = obs_data_create();
+			obs_data_set_string(s2, "muxer_settings", obs_data_get_string(settings, "muxer_settings"));
+			obs_output_update(fileOutput2, s2);
+		} else {
+			dualRecordSeparate = false;
+			fileOutput2 = nullptr;
+		}
+	} else {
+		fileOutput2 = nullptr;
+	}
+}
+
+const char *AdvancedOutput::Stream2RecordMode() const
+{
+	const char *mode = config_get_string(main->Config(), "Stream2", "RecordMode");
+	if (!mode || !*mode)
+		return "multitrack";
+	return mode;
+}
+
+bool AdvancedOutput::SetupSeparateRecording()
+{
+	if (!videoStreaming2)
+		return false;
+
+	if (!fileOutput2) {
+		fileOutput2 = obs_output_create("ffmpeg_muxer", "adv_file_output2", nullptr, nullptr);
+		if (!fileOutput2) {
+			blog(LOG_WARNING, "Failed to create second recording output");
+			return false;
+		}
+	}
+
+	if (!obs_encoder_video(videoStreaming2)) {
+		OBSCanvasAutoRelease canvas;
+		const char *uuid = config_get_string(main->Config(), "Stream2", "CanvasUuid");
+		if (uuid && *uuid)
+			canvas = obs_get_canvas_by_uuid(uuid);
+		if (!canvas) {
+			obs_canvas_t *ensured = main->EnsureSecondScreenCanvas();
+			if (ensured)
+				canvas = obs_canvas_get_ref(ensured);
+		}
+		if (!canvas)
+			return false;
+		video_t *video = obs_canvas_get_video(canvas);
+		if (!video)
+			return false;
+		obs_encoder_set_video(videoStreaming2, video);
+	}
+
+	obs_output_set_video_encoder(fileOutput2, videoStreaming2);
+
+	const char *recFormat = config_get_string(main->Config(), "AdvOut", "RecFormat2");
+	bool flv = strcmp(recFormat, "flv") == 0;
+	int tracks = flv ? config_get_int(main->Config(), "AdvOut", "FLVTrack")
+			 : config_get_int(main->Config(), "AdvOut", "RecTracks");
+	if (tracks == 0)
+		tracks = config_get_int(main->Config(), "AdvOut", "TrackIndex");
+
+	int idx = 0;
+	if (!flv) {
+		for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
+			if ((tracks & (1 << i)) != 0) {
+				obs_output_set_audio_encoder(fileOutput2, recordTrack[i], idx++);
+			}
+		}
+	} else if (tracks != 0) {
+		obs_output_set_audio_encoder(fileOutput2, recordTrack[tracks - 1], 0);
+	}
+
+	blog(LOG_INFO, "Separate dual-canvas MKV: second file uses encoder '%s'",
+	     obs_encoder_get_name(videoStreaming2));
+	return true;
+}
+
+static std::string InsertFilenameSuffix(const std::string &path, const char *suffix)
+{
+	size_t slash = path.find_last_of("/\\");
+	size_t dot = path.find_last_of('.');
+	if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+		return path.substr(0, dot) + suffix + path.substr(dot);
+	return path + suffix;
 }
 
 inline void AdvancedOutput::SetupFFmpeg()
@@ -995,6 +1084,18 @@ bool AdvancedOutput::StartRecording()
 		}
 
 		obs_output_update(fileOutput, settings);
+
+		if (dualRecordSeparate && fileOutput2) {
+			OBSDataAutoRelease settings2 = obs_data_create();
+			obs_data_apply(settings2, settings);
+			string path2 = InsertFilenameSuffix(strPath, "_canvas2");
+			obs_data_set_string(settings2, ffmpegRecording ? "url" : "path", path2.c_str());
+			if (splitFile) {
+				string fmt2 = string(filenameFormat) + "_canvas2";
+				obs_data_set_string(settings2, "format", fmt2.c_str());
+			}
+			obs_output_update(fileOutput2, settings2);
+		}
 	}
 
 	if (!obs_output_start(fileOutput)) {
@@ -1007,6 +1108,17 @@ bool AdvancedOutput::StartRecording()
 		}
 		QMessageBox::critical(main, QTStr("Output.StartRecordingFailed"), error_reason);
 		return false;
+	}
+
+	if (dualRecordSeparate && fileOutput2) {
+		if (!obs_output_start(fileOutput2)) {
+			const char *error = obs_output_get_last_error(fileOutput2);
+			blog(LOG_ERROR, "Second canvas recording failed to start: %s", error ? error : "(unknown)");
+			obs_output_force_stop(fileOutput);
+			QMessageBox::critical(main, QTStr("Output.StartRecordingFailed"),
+					      error && *error ? QT_UTF8(error) : QTStr("Output.StartFailedGeneric"));
+			return false;
+		}
 	}
 
 	return true;
@@ -1101,11 +1213,23 @@ void AdvancedOutput::StopStreaming(bool force)
 
 void AdvancedOutput::StopRecording(bool force)
 {
+	if (fileOutput2) {
+		if (force)
+			obs_output_force_stop(fileOutput2);
+		else
+			obs_output_stop(fileOutput2);
+	}
+
 	if (force) {
 		obs_output_force_stop(fileOutput);
 	} else {
 		obs_output_stop(fileOutput);
 	}
+}
+
+bool AdvancedOutput::RecordingActive() const
+{
+	return obs_output_active(fileOutput) || (fileOutput2 && obs_output_active(fileOutput2));
 }
 
 void AdvancedOutput::StopReplayBuffer(bool force)
@@ -1120,11 +1244,6 @@ void AdvancedOutput::StopReplayBuffer(bool force)
 bool AdvancedOutput::StreamingActive() const
 {
 	return obs_output_active(StreamingOutput());
-}
-
-bool AdvancedOutput::RecordingActive() const
-{
-	return obs_output_active(fileOutput);
 }
 
 bool AdvancedOutput::ReplayBufferActive() const
